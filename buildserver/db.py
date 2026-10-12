@@ -1,10 +1,18 @@
-"""SQLite-backed build records. The table doubles as the task queue: the worker
-claims the oldest row with status 'queued'."""
+"""SQLite-backed build records.
 
+The builds table doubles as the task queue: the worker claims the oldest row
+whose status is QUEUED.
+"""
+
+from collections.abc import Iterator
+import contextlib
+import datetime
+import pathlib
 import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
+from typing import Any
+
+# A row of the builds table, keyed by column name.
+Build = dict[str, Any]
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -12,7 +20,7 @@ SUCCEEDED = "succeeded"
 FAILED = "failed"
 CANCELLED = "cancelled"
 
-SCHEMA = """
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS builds (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -30,18 +38,43 @@ CREATE INDEX IF NOT EXISTS builds_status ON builds (status, created_at);
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    """Returns the current UTC time as an ISO 8601 string."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="milliseconds"
+    )
 
 
 class Database:
-    def __init__(self, path: Path):
+    """Access to the build records.
+
+    Every method opens its own connection, so one instance can be shared
+    between threads, and the API and worker processes can each have their own.
+
+    Attributes:
+        path: Location of the SQLite database file.
+    """
+
+    def __init__(self, path: pathlib.Path) -> None:
+        """Opens the database, creating the schema if it is missing.
+
+        Args:
+            path: Location of the SQLite database file.
+        """
         self.path = path
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(SCHEMA)
+            conn.executescript(_SCHEMA)
 
-    @contextmanager
-    def _connect(self):
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Opens a connection for one transaction.
+
+        The transaction is committed when the block exits normally and rolled
+        back if it raises. The connection is closed either way.
+
+        Yields:
+            The open connection.
+        """
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
@@ -50,59 +83,129 @@ class Database:
         finally:
             conn.close()
 
-    def create(self, build_id: str, name: str, package_filename: str) -> dict:
+    def create(self, build_id: str, name: str, package_filename: str) -> Build:
+        """Adds a build to the queue.
+
+        Args:
+            build_id: Unique id of the new build.
+            name: Build name, passed to the build command.
+            package_filename: File name of the uploaded package, as given by
+                the client.
+
+        Returns:
+            The new build record.
+        """
         with self._connect() as conn:
             row = conn.execute(
-                "INSERT INTO builds (id, name, status, package_filename, created_at)"
+                "INSERT INTO builds"
+                " (id, name, status, package_filename, created_at)"
                 " VALUES (?, ?, ?, ?, ?) RETURNING *",
                 (build_id, name, QUEUED, package_filename, now()),
             ).fetchone()
         return dict(row)
 
-    def get(self, build_id: str) -> dict | None:
+    def get(self, build_id: str) -> Build | None:
+        """Looks up a build.
+
+        Args:
+            build_id: Id of the build.
+
+        Returns:
+            The build record, or None if there is no such build.
+        """
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM builds WHERE id = ?", (build_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM builds WHERE id = ?", (build_id,)
+            ).fetchone()
         return dict(row) if row else None
 
-    def list(self, limit: int = 200) -> list[dict]:
+    def list_builds(self, limit: int = 200) -> list[Build]:
+        """Lists the most recent builds.
+
+        Args:
+            limit: Maximum number of builds to return.
+
+        Returns:
+            The build records, newest first.
+        """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM builds ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
+                "SELECT * FROM builds"
+                " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (limit,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(row) for row in rows]
 
-    def claim_next(self) -> dict | None:
-        """Atomically move the oldest queued build to 'running' and return it."""
+    def claim_next(self) -> Build | None:
+        """Atomically moves the oldest queued build to RUNNING.
+
+        Returns:
+            The claimed build record, or None if the queue is empty.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "UPDATE builds SET status = ?, started_at = ? WHERE id = ("
-                " SELECT id FROM builds WHERE status = ? ORDER BY created_at, rowid LIMIT 1"
+                " SELECT id FROM builds WHERE status = ?"
+                " ORDER BY created_at, rowid LIMIT 1"
                 ") RETURNING *",
                 (RUNNING, now(), QUEUED),
             ).fetchone()
         return dict(row) if row else None
 
-    def finish(self, build_id: str, status: str, exit_code: int | None, error: str | None) -> None:
+    def finish(
+        self,
+        build_id: str,
+        status: str,
+        exit_code: int | None,
+        error: str | None,
+    ) -> None:
+        """Records the outcome of a build.
+
+        Args:
+            build_id: Id of the build.
+            status: Final status: SUCCEEDED, FAILED or CANCELLED.
+            exit_code: Exit code of the build command, or None if it did not
+                run to completion.
+            error: Human-readable reason for a failure, or None.
+        """
         with self._connect() as conn:
             conn.execute(
-                "UPDATE builds SET status = ?, finished_at = ?, exit_code = ?, error = ? WHERE id = ?",
+                "UPDATE builds SET status = ?, finished_at = ?, exit_code = ?,"
+                " error = ? WHERE id = ?",
                 (status, now(), exit_code, error, build_id),
             )
 
     def request_cancel(self, build_id: str) -> None:
-        """Cancel a queued build outright; flag a running one for the worker to kill."""
+        """Cancels a build.
+
+        A queued build is cancelled outright. A running build is flagged for
+        the worker to kill. A build that is already over is left untouched.
+
+        Args:
+            build_id: Id of the build.
+        """
         with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE builds SET status = ?, finished_at = ? WHERE id = ? AND status = ?",
+            cursor = conn.execute(
+                "UPDATE builds SET status = ?, finished_at = ?"
+                " WHERE id = ? AND status = ?",
                 (CANCELLED, now(), build_id, QUEUED),
             )
-            if cur.rowcount == 0:
+            if cursor.rowcount == 0:
                 conn.execute(
-                    "UPDATE builds SET cancel_requested = 1 WHERE id = ? AND status = ?",
+                    "UPDATE builds SET cancel_requested = 1"
+                    " WHERE id = ? AND status = ?",
                     (build_id, RUNNING),
                 )
 
     def cancel_requested(self, build_id: str) -> bool:
+        """Tells whether a build has been flagged for cancellation.
+
+        Args:
+            build_id: Id of the build.
+
+        Returns:
+            True if cancellation of the build was requested while it ran.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT cancel_requested FROM builds WHERE id = ?", (build_id,)
@@ -110,10 +213,20 @@ class Database:
         return bool(row and row["cancel_requested"])
 
     def fail_interrupted(self) -> int:
-        """Mark builds left 'running' by a dead worker as failed."""
+        """Marks builds left RUNNING by a dead worker as FAILED.
+
+        Returns:
+            The number of builds that were marked.
+        """
         with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE builds SET status = ?, finished_at = ?, error = ? WHERE status = ?",
-                (FAILED, now(), "worker stopped while the build was running", RUNNING),
+            cursor = conn.execute(
+                "UPDATE builds SET status = ?, finished_at = ?, error = ?"
+                " WHERE status = ?",
+                (
+                    FAILED,
+                    now(),
+                    "worker stopped while the build was running",
+                    RUNNING,
+                ),
             )
-        return cur.rowcount
+        return cursor.rowcount

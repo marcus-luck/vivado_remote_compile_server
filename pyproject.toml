@@ -15,11 +15,33 @@ dependencies = [
 dev = [
     "httpx>=0.27",
     "pytest>=8",
+    "ruff>=0.17.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Google Python Style Guide: 80 columns, Google docstrings, one import per line
+# sorted by full module path.
+[tool.ruff]
+line-length = 80
+
+[tool.ruff.lint]
+select = ["D", "E", "F", "I", "N", "W"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+force-single-line = true
+force-sort-within-sections = true
+order-by-type = false
+known-first-party = ["buildserver"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test functions are named after what they check.
+"tests/*" = ["D103"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
