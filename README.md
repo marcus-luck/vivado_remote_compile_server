@@ -68,22 +68,23 @@ curl -OJ http://host:8000/api/builds/<id>/artifacts
 ## Configuration
 
 Configuration lives in a `.env` file in the directory the processes are started
-from. Copy `.env.template` to `.env` and edit it; every variable is optional.
+from. Copy `.env.template` to `.env` and edit it. No path has a default in the
+code: the processes refuse to start if a required variable is missing.
 Variables set in the real environment win over the file, and any other variable
 in the file (a Vivado licence server, say) is passed on to the build command.
 
 Read by both processes:
 
-| Variable | Default | |
+| Variable | | |
 | --- | --- | --- |
-| `BUILDSERVER_DATA_DIR` | `./data` | Database, packages, logs, artifacts, work directories |
-| `BUILDSERVER_VIVADO` | newest under `C:\AMD\Vivado`, `C:\Xilinx\Vivado`, else `vivado` on PATH | Vivado executable |
-| `BUILDSERVER_BUILD_SCRIPT` | `build.tcl` | File that must be in the package |
-| `BUILDSERVER_BUILD_COMMAND` | the Vivado command above | JSON list of arguments, `{name}` is the build name. Overrides `BUILDSERVER_VIVADO` |
-| `BUILDSERVER_ARTIFACT_DIR` | `bitfiles/generated/{name}` | Directory zipped as the artifacts |
-| `BUILDSERVER_BUILD_TIMEOUT` | `21600` | Seconds before a build is killed |
-| `BUILDSERVER_MAX_UPLOAD_BYTES` | `2147483648` | Upload size limit |
-| `BUILDSERVER_KEEP_WORKDIR` | unset | Set to `1` to keep the extracted package after the build |
+| `BUILDSERVER_DATA_DIR` | required | Database, packages, logs, artifacts, work directories |
+| `BUILDSERVER_VIVADO` | required unless `BUILDSERVER_BUILD_COMMAND` is set | Vivado executable |
+| `BUILDSERVER_BUILD_SCRIPT` | required | File that must be at the top level of the package |
+| `BUILDSERVER_ARTIFACT_DIR` | required | Directory zipped as the artifacts, relative to the package root. `{name}` is the build name |
+| `BUILDSERVER_BUILD_COMMAND` | optional | JSON list of arguments, `{name}` is the build name. Replaces the Vivado command line |
+| `BUILDSERVER_BUILD_TIMEOUT` | default `21600` | Seconds before a build is killed |
+| `BUILDSERVER_MAX_UPLOAD_BYTES` | default `2147483648` | Upload size limit |
+| `BUILDSERVER_KEEP_WORKDIR` | default off | Set to `1` to keep the extracted package after the build |
 
 On Windows keep the data directory path short: Vivado fails on paths over 260 characters.
 
@@ -94,3 +95,13 @@ uv run pytest
 ```
 
 The tests use a small Python script in place of Vivado.
+
+## Style
+
+Python code follows the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html),
+enforced with ruff:
+
+```
+uv run ruff format .
+uv run ruff check .
+```

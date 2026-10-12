@@ -47,6 +47,7 @@ def env(tmp_path):
         data_dir=tmp_path,
         build_command=[sys.executable, "build.py", "{name}"],
         build_script="build.py",
+        artifact_dir="bitfiles/generated/{name}",
     )
     store = storage.Storage(settings.data_dir)
     database = db.Database(store.db_path)
@@ -187,10 +188,10 @@ def test_cancel_queued_build(env):
 def test_cancel_running_build(env):
     settings, database, store, client = env
     build = upload(client, make_package(SLOW_BUILD)).json()
-    worker = threading.Thread(
+    thread = threading.Thread(
         target=worker.run_once, args=(settings, database, store)
     )
-    worker.start()
+    thread.start()
     deadline = time.monotonic() + 10
     while (
         client.get(f"/api/builds/{build['id']}").json()["status"] != "running"
@@ -203,8 +204,8 @@ def test_cancel_running_build(env):
         ]
         is True
     )
-    worker.join(timeout=20)
-    assert not worker.is_alive()
+    thread.join(timeout=20)
+    assert not thread.is_alive()
     assert (
         client.get(f"/api/builds/{build['id']}").json()["status"] == "cancelled"
     )
@@ -224,6 +225,8 @@ def test_settings_come_from_env_file(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text(
         "BUILDSERVER_DATA_DIR=store\n"
         "BUILDSERVER_VIVADO=C:\\Xilinx\\Vivado\\2023.2\\bin\\vivado.bat\n"
+        "BUILDSERVER_BUILD_SCRIPT=build.tcl\n"
+        "BUILDSERVER_ARTIFACT_DIR=out/{name}\n"
         "BUILDSERVER_BUILD_TIMEOUT=120\n"
         "BUILDSERVER_KEEP_WORKDIR=1\n"
         "XILINXD_LICENSE_FILE=2100@host\n"
@@ -234,13 +237,19 @@ def test_settings_come_from_env_file(tmp_path, monkeypatch):
         r"C:\Xilinx\Vivado\2023.2\bin\vivado.bat",
         "-mode",
     ]
+    assert settings.build_script == "build.tcl"
+    assert settings.artifact_dir == "out/{name}"
     assert settings.keep_workdir is True
     assert settings.build_timeout == 60  # the real environment wins over .env
     assert (
         os.environ["XILINXD_LICENSE_FILE"] == "2100@host"
     )  # inherited by the build command
 
+    # A full build command makes the Vivado path unnecessary.
     (tmp_path / ".env").write_text(
+        "BUILDSERVER_DATA_DIR=store\n"
+        "BUILDSERVER_BUILD_SCRIPT=build.tcl\n"
+        "BUILDSERVER_ARTIFACT_DIR=out/{name}\n"
         """BUILDSERVER_BUILD_COMMAND='["radiantc", "build.tcl", "{name}"]'\n"""
     )
     monkeypatch.setattr(os, "environ", {})
@@ -249,6 +258,29 @@ def test_settings_come_from_env_file(tmp_path, monkeypatch):
         "build.tcl",
         "{name}",
     ]
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "BUILDSERVER_DATA_DIR",
+        "BUILDSERVER_VIVADO",
+        "BUILDSERVER_BUILD_SCRIPT",
+        "BUILDSERVER_ARTIFACT_DIR",
+    ],
+)
+def test_path_settings_have_no_default(tmp_path, monkeypatch, missing):
+    variables = {
+        "BUILDSERVER_DATA_DIR": "store",
+        "BUILDSERVER_VIVADO": "vivado",
+        "BUILDSERVER_BUILD_SCRIPT": "build.tcl",
+        "BUILDSERVER_ARTIFACT_DIR": "out/{name}",
+    }
+    del variables[missing]
+    monkeypatch.setattr(os, "environ", variables)
+    monkeypatch.chdir(tmp_path)  # no .env here
+    with pytest.raises(ValueError, match=missing):
+        config.load_settings()
 
 
 def ui_upload(client, package: bytes, name: str = "ui_fw"):
