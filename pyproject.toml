@@ -1,0 +1,25 @@
+[project]
+name = "buildserver"
+version = "0.1.0"
+description = "Firmware build server: upload a build package, queue it, build it, download the artifacts."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "jinja2>=3.1.6",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.9",
+    "uvicorn[standard]>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

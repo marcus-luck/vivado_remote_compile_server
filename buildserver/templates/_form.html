@@ -1,0 +1,20 @@
+<section id="upload">
+  <h2>Queue a build</h2>
+  <form hx-post="ui/builds" hx-encoding="multipart/form-data" hx-target="#upload" hx-swap="outerHTML"
+        hx-disabled-elt="find button">
+    <label>
+      Build name
+      <input type="text" name="name" value="{{ name or '' }}"
+             pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}"
+             title="Letters, digits, dot, underscore and dash; start with a letter or digit"
+             placeholder="defaults to the package file name">
+    </label>
+    <label>
+      Build package (.zip)
+      <input type="file" name="package" accept=".zip" required>
+    </label>
+    <button type="submit">Queue build</button>
+    <progress id="upload-progress" class="htmx-indicator" value="0" max="100"></progress>
+  </form>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+</section>

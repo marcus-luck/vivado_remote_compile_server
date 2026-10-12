@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Firmware build server</title>
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Firmware build server</h1>
+  </header>
+
+  <main>
+    {% include "_form.html" %}
+
+    <section>
+      <h2>Builds</h2>
+      <div id="builds" hx-get="ui/builds" hx-trigger="every 3s, refresh from:body">
+        {% include "_builds.html" %}
+      </div>
+    </section>
+
+    <div id="log"></div>
+  </main>
+
+  <script src="static/vendor/htmx.min.js"></script>
+  <script src="static/app.js"></script>
+</body>
+</html>

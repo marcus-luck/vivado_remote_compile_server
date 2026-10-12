@@ -1,0 +1,9 @@
+<section>
+  <h2>
+    Log: {{ build.name }}
+    <button type="button" hx-on:click="htmx.find('#log').innerHTML = ''">Close</button>
+    <a class="button" href="api/builds/{{ build.id }}/log?tail=0" target="_blank">Full log</a>
+  </h2>
+  {# Polls until the server answers 286, which it does once the build is over. #}
+  <pre class="log" hx-get="ui/builds/{{ build.id }}/log/text" hx-trigger="every 3s">{{ text or '(empty)' }}</pre>
+</section>
