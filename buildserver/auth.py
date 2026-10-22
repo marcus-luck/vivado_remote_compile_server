@@ -1,19 +1,29 @@
-"""Google sign-in, sessions and the user management API.
+"""Google sign-in, sessions, API tokens and the user management API.
 
-Users sign in with a Google account through OAuth (OpenID Connect). A signed
+People sign in with a Google account through OAuth (OpenID Connect). A signed
 session cookie then identifies them. Who may sign in is decided by the users
 table: an account has to be added by an administrator first, unless it is
 listed as an administrator in the configuration or belongs to an allowed
 domain.
 
+Scripts and robots authenticate with an API token instead, sent as
+"Authorization: Bearer <token>". A person creates tokens for themselves while
+signed in. Robots get service accounts: users an administrator adds, which
+cannot sign in with Google and use only the tokens an administrator creates
+for them. Tokens cannot be used to create tokens.
+
 Routes:
 
     /auth/login, /auth/callback, /auth/logout   sign-in flow
-    /api/me                                     the signed-in user
+    /api/me                                     the authenticated user
+    /api/tokens...                              the user's own API tokens
     /api/users...                               user management, admins only
 """
 
+import datetime
+import hashlib
 import re
+import secrets
 import sqlite3
 from typing import Any
 from typing import Literal
@@ -21,6 +31,7 @@ from typing import Literal
 from authlib.integrations import starlette_client
 import fastapi
 from fastapi import responses
+from fastapi import security
 import pydantic
 
 from buildserver import config
@@ -35,20 +46,35 @@ _GOOGLE_METADATA_URL = (
     "https://accounts.google.com/.well-known/openid-configuration"
 )
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SERVICE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _SESSION_USER_ID = "user_id"
 _SESSION_LOGIN_ERROR = "login_error"
+
+TOKEN_PREFIX = "bst_"
+# Characters after TOKEN_PREFIX that are stored to tell tokens apart.
+_TOKEN_SHOWN_CHARS = 8
+_MAX_TOKEN_DAYS = 3650
+
+_bearer = security.HTTPBearer(
+    auto_error=False,
+    description="An API token, created on the web page or at /api/tokens.",
+)
 
 
 class UserCreate(pydantic.BaseModel):
     """Body of a request that adds a user.
 
     Attributes:
-        email: Email of the Google account that may sign in.
+        email: Email of the Google account that may sign in, or for a
+            service account its name.
         role: Role of the new user.
+        is_service: Whether to add a service account, which cannot sign in
+            and authenticates only with API tokens.
     """
 
     email: str
     role: Role = ROLE_USER
+    is_service: bool = False
 
 
 class UserUpdate(pydantic.BaseModel):
@@ -63,6 +89,21 @@ class UserUpdate(pydantic.BaseModel):
     is_active: bool | None = None
 
 
+class TokenCreate(pydantic.BaseModel):
+    """Body of a request that creates an API token.
+
+    Attributes:
+        name: What the token is for, e.g. "laptop" or "nightly CI".
+        expires_in_days: Days until the token stops working, or None for a
+            token that works until it is revoked.
+    """
+
+    name: str = pydantic.Field(min_length=1, max_length=64)
+    expires_in_days: int | None = pydantic.Field(
+        default=None, ge=1, le=_MAX_TOKEN_DAYS
+    )
+
+
 def present_user(user: db.User) -> dict[str, Any]:
     """Returns a user record as it is shown to clients."""
     return {
@@ -72,9 +113,113 @@ def present_user(user: db.User) -> dict[str, Any]:
         "picture": user["picture"],
         "role": user["role"],
         "is_active": bool(user["is_active"]),
+        "is_service": bool(user["is_service"]),
         "created_at": user["created_at"],
         "last_login_at": user["last_login_at"],
     }
+
+
+def present_token(token: db.Token) -> dict[str, Any]:
+    """Returns a token record as it is shown to clients, without its hash."""
+    return {
+        "id": token["id"],
+        "user_id": token["user_id"],
+        "name": token["name"],
+        "prefix": token["prefix"],
+        "created_at": token["created_at"],
+        "expires_at": token["expires_at"],
+        "last_used_at": token["last_used_at"],
+    }
+
+
+def _hash_token(token: str) -> str:
+    """Returns the hash under which a token is stored.
+
+    Tokens are long random strings, so a fast hash is enough.
+    """
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def issue_token(
+    database: db.Database,
+    user_id: int,
+    name: str,
+    expires_in_days: int | None,
+) -> tuple[db.Token, str]:
+    """Creates an API token.
+
+    Args:
+        database: The user records.
+        user_id: Id of the user the token authenticates as.
+        name: What the token is for.
+        expires_in_days: Days until the token stops working, or None if it
+            does not expire.
+
+    Returns:
+        The token record and the token itself. Only its hash is stored, so
+        this is the only time the token is available.
+    """
+    secret = secrets.token_urlsafe(32)
+    expires_at = None
+    if expires_in_days is not None:
+        expires_at = (
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(days=expires_in_days)
+        ).isoformat(timespec="milliseconds")
+    token = TOKEN_PREFIX + secret
+    record = database.create_token(
+        user_id,
+        name.strip(),
+        secret[:_TOKEN_SHOWN_CHARS],
+        _hash_token(token),
+        expires_at,
+    )
+    return record, token
+
+
+def revoke_token(database: db.Database, user: db.User, token_id: int) -> bool:
+    """Revokes an API token on behalf of a user.
+
+    Users may revoke their own tokens; administrators may revoke any.
+
+    Args:
+        database: The user records.
+        user: The user asking to revoke the token.
+        token_id: Id of the token.
+
+    Returns:
+        True if the token was revoked, False if there is no such token or it
+        belongs to someone else.
+    """
+    token = database.get_token(token_id)
+    if token is None:
+        return False
+    if token["user_id"] != user["id"] and user["role"] != ROLE_ADMIN:
+        return False
+    return database.delete_token(token_id)
+
+
+def user_for_token(database: db.Database, token: str) -> db.User | None:
+    """Finds the user an API token authenticates as.
+
+    Args:
+        database: The user records.
+        token: The token, as sent by the client.
+
+    Returns:
+        The user, or None if the token is unknown or expired, or the user
+        has been deactivated.
+    """
+    record = database.get_token_by_hash(_hash_token(token))
+    if record is None:
+        return None
+    if record["expires_at"] is not None and record["expires_at"] <= db.now():
+        return None
+    user = database.get_user(record["user_id"])
+    if user is None or not user["is_active"]:
+        return None
+    database.touch_token(record["id"])
+    return user
 
 
 def optional_user(request: fastapi.Request) -> db.User | None:
@@ -97,22 +242,72 @@ def optional_user(request: fastapi.Request) -> db.User | None:
     return user
 
 
-def current_user(request: fastapi.Request) -> db.User:
-    """FastAPI dependency that requires a signed-in user.
+def current_user(
+    request: fastapi.Request,
+    credentials: security.HTTPAuthorizationCredentials | None = fastapi.Depends(
+        _bearer
+    ),
+) -> db.User:
+    """FastAPI dependency that requires an API token or a signed-in user.
+
+    A request that carries a bearer token is authenticated by the token
+    alone, even if it also has a session.
 
     Args:
         request: The request.
+        credentials: The bearer token of the request, if it has one.
+
+    Returns:
+        The authenticated user.
+
+    Raises:
+        fastapi.HTTPException: With status 401 if the token is not valid, or
+            there is no token and nobody is signed in.
+    """
+    if credentials is not None:
+        user = user_for_token(
+            request.app.state.database, credentials.credentials
+        )
+        if user is None:
+            raise fastapi.HTTPException(
+                401,
+                "invalid or expired API token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user
+    user = optional_user(request)
+    if user is None:
+        raise fastapi.HTTPException(401, "not signed in")
+    return user
+
+
+def session_user(
+    request: fastapi.Request,
+    credentials: security.HTTPAuthorizationCredentials | None = fastapi.Depends(
+        _bearer
+    ),
+) -> db.User:
+    """FastAPI dependency that requires a signed-in user, not an API token.
+
+    Used where a leaked token must not be able to do more, such as creating
+    further tokens.
+
+    Args:
+        request: The request.
+        credentials: The bearer token of the request, if it has one.
 
     Returns:
         The signed-in user.
 
     Raises:
-        fastapi.HTTPException: With status 401 if nobody is signed in.
+        fastapi.HTTPException: With status 403 if the request uses an API
+            token, or 401 if nobody is signed in.
     """
-    user = optional_user(request)
-    if user is None:
-        raise fastapi.HTTPException(401, "not signed in")
-    return user
+    if credentials is not None:
+        raise fastapi.HTTPException(
+            403, "API tokens cannot be used for this; sign in on the web page"
+        )
+    return current_user(request, None)
 
 
 def admin_user(
@@ -166,6 +361,8 @@ def resolve_sign_in(
     is_configured_admin = email in auth_settings.admin_emails
 
     user = database.get_user_by_email(email)
+    if user is not None and user["is_service"]:
+        return None
     if user is None:
         if is_configured_admin:
             user = database.create_user(email, ROLE_ADMIN)
@@ -271,13 +468,45 @@ def create_router(
         request.session.clear()
         return responses.RedirectResponse(home_url, status_code=303)
 
+    # API tokens ##############################################################
+
+    @router.get("/api/tokens")
+    def list_tokens(
+        user: db.User = fastapi.Depends(current_user),
+    ) -> list[dict[str, Any]]:
+        """Lists the API tokens of the authenticated user."""
+        return [present_token(t) for t in database.list_tokens(user["id"])]
+
+    @router.post("/api/tokens", status_code=201)
+    def create_token(
+        body: TokenCreate,
+        user: db.User = fastapi.Depends(session_user),
+    ) -> dict[str, Any]:
+        """Creates an API token for the signed-in user.
+
+        The response is the only place the token is shown.
+        """
+        record, token = issue_token(
+            database, user["id"], body.name, body.expires_in_days
+        )
+        return {**present_token(record), "token": token}
+
+    @router.delete("/api/tokens/{token_id}", status_code=204)
+    def delete_token(
+        token_id: int,
+        user: db.User = fastapi.Depends(current_user),
+    ) -> None:
+        """Revokes one of the user's tokens, or any token for an admin."""
+        if not revoke_token(database, user, token_id):
+            raise fastapi.HTTPException(404, "token not found")
+
     # User management API #####################################################
 
     @router.get("/api/me")
     def get_me(
         user: db.User = fastapi.Depends(current_user),
     ) -> dict[str, Any]:
-        """Returns the signed-in user."""
+        """Returns the authenticated user."""
         return present_user(user)
 
     admins_only = [fastapi.Depends(admin_user)]
@@ -289,12 +518,25 @@ def create_router(
 
     @router.post("/api/users", status_code=201, dependencies=admins_only)
     def create_user(body: UserCreate) -> dict[str, Any]:
-        """Adds a user, allowing that Google account to sign in."""
+        """Adds a user, allowing that Google account to sign in.
+
+        With is_service, adds a service account instead, named by the email
+        field.
+        """
         email = body.email.strip().lower()
-        if not _EMAIL_RE.fullmatch(email):
+        if body.is_service:
+            if not _SERVICE_NAME_RE.fullmatch(email):
+                raise fastapi.HTTPException(
+                    422,
+                    "a service account name must be 1-64 characters of"
+                    " a-z 0-9 . _ - and start with a letter or digit",
+                )
+        elif not _EMAIL_RE.fullmatch(email):
             raise fastapi.HTTPException(422, "email is not a valid address")
         try:
-            return present_user(database.create_user(email, body.role))
+            return present_user(
+                database.create_user(email, body.role, body.is_service)
+            )
         except sqlite3.IntegrityError as e:
             raise fastapi.HTTPException(
                 409, "a user with that email already exists"
@@ -334,5 +576,27 @@ def create_router(
                 409, "you cannot delete your own account"
             )
         database.delete_user(user_id)
+
+    @router.get("/api/users/{user_id}/tokens", dependencies=admins_only)
+    def list_user_tokens(user_id: int) -> list[dict[str, Any]]:
+        """Lists the API tokens of any user."""
+        get_or_404(user_id)
+        return [present_token(t) for t in database.list_tokens(user_id)]
+
+    @router.post(
+        "/api/users/{user_id}/tokens",
+        status_code=201,
+        dependencies=[*admins_only, fastapi.Depends(session_user)],
+    )
+    def create_user_token(user_id: int, body: TokenCreate) -> dict[str, Any]:
+        """Creates an API token for any user, typically a service account.
+
+        The response is the only place the token is shown.
+        """
+        get_or_404(user_id)
+        record, token = issue_token(
+            database, user_id, body.name, body.expires_in_days
+        )
+        return {**present_token(record), "token": token}
 
     return router

@@ -48,6 +48,11 @@ form { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
 label { display: flex; flex-direction: column; gap: 4px; font-weight: 600; }
 input[type="text"] { width: 280px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; font: inherit; }
 input[type="text"]:invalid { border-color: var(--error); }
+select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; font: inherit; }
+
+#tokens table { margin-bottom: 16px; }
+.new-token { margin-bottom: 16px; padding: 12px; background: #d9f0df; border-radius: 4px; }
+.new-token input[type="text"] { width: 100%; font-family: Consolas, "Cascadia Mono", monospace; }
 progress { width: 160px; height: 30px; }
 
 button, a.button {

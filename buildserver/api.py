@@ -6,8 +6,8 @@ Run with:
 
 /api/... is the JSON API. / and /ui/... serve the front end: / is the full
 page, and the /ui/... routes return the HTML fragments htmx swaps into it.
-Sign-in and user management live in buildserver.auth; every route here except
-/ requires a signed-in user.
+Sign-in, API tokens and user management live in buildserver.auth; every route
+here except / requires a signed-in user or an API token.
 """
 
 import datetime
@@ -22,6 +22,7 @@ from fastapi import responses
 from fastapi import staticfiles
 from fastapi import templating
 import markupsafe
+import pydantic
 from starlette.middleware import sessions
 
 from buildserver import auth
@@ -269,7 +270,13 @@ def create_app(
                 request, "login.html", {"error": auth.pop_login_error(request)}
             )
         return templates.TemplateResponse(
-            request, "index.html", {"builds": present_all(), "user": user}
+            request,
+            "index.html",
+            {
+                "builds": present_all(),
+                "user": user,
+                "tokens": database.list_tokens(user["id"]),
+            },
         )
 
     @protected.get("/ui/builds", response_class=responses.HTMLResponse)
@@ -340,6 +347,71 @@ def create_app(
             str(markupsafe.escape(text)),
             status_code=200 if active else _HTMX_STOP_POLLING,
         )
+
+    def tokens_fragment(
+        request: fastapi.Request, user: db.User, **context: object
+    ) -> responses.Response:
+        """Serves the API token section for a user.
+
+        Args:
+            request: The request.
+            user: The user whose tokens are listed.
+            **context: Further template variables: new_token, error, name.
+
+        Returns:
+            The rendered fragment.
+        """
+        return templates.TemplateResponse(
+            request,
+            "_tokens.html",
+            {"tokens": database.list_tokens(user["id"]), **context},
+        )
+
+    @protected.get("/ui/tokens", response_class=responses.HTMLResponse)
+    def ui_tokens(
+        request: fastapi.Request,
+        user: db.User = fastapi.Depends(auth.current_user),
+    ) -> responses.Response:
+        """Serves the API token section."""
+        return tokens_fragment(request, user)
+
+    @protected.post("/ui/tokens", response_class=responses.HTMLResponse)
+    def ui_create_token(
+        request: fastapi.Request,
+        name: str = fastapi.Form(""),
+        expires_in_days: str = fastapi.Form(""),
+        user: db.User = fastapi.Depends(auth.session_user),
+    ) -> responses.Response:
+        """Creates an API token and serves the section showing it once.
+
+        Errors are reported inside the section with status 200, because htmx
+        does not swap in 4xx responses.
+        """
+        try:
+            body = auth.TokenCreate(
+                name=name.strip(), expires_in_days=expires_in_days or None
+            )
+        except pydantic.ValidationError as e:
+            error = "; ".join(
+                f"{err['loc'][-1]}: {err['msg']}" for err in e.errors()
+            )
+            return tokens_fragment(request, user, error=error, name=name)
+        _, token = auth.issue_token(
+            database, user["id"], body.name, body.expires_in_days
+        )
+        return tokens_fragment(request, user, new_token=token)
+
+    @protected.post(
+        "/ui/tokens/{token_id}/revoke", response_class=responses.HTMLResponse
+    )
+    def ui_revoke_token(
+        request: fastapi.Request,
+        token_id: int,
+        user: db.User = fastapi.Depends(auth.current_user),
+    ) -> responses.Response:
+        """Revokes one of the user's API tokens and serves the section."""
+        auth.revoke_token(database, user, token_id)
+        return tokens_fragment(request, user)
 
     app.include_router(protected)
     app.mount(

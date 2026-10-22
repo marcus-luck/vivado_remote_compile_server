@@ -1,7 +1,11 @@
 """SQLite-backed build and user records.
 
 The builds table doubles as the task queue: the worker claims the oldest row
-whose status is QUEUED. The users table holds the accounts that may sign in.
+whose status is QUEUED. The users table holds the accounts that may use the
+server: people, who sign in with Google, and service accounts, which only use
+API tokens. The email column is the account identifier: a Google email for a
+person, a name without "@" for a service account. The api_tokens table holds
+hashes of the API tokens.
 """
 
 from collections.abc import Iterator
@@ -15,6 +19,8 @@ from typing import Any
 Build = dict[str, Any]
 # A row of the users table, keyed by column name.
 User = dict[str, Any]
+# A row of the api_tokens table, keyed by column name.
+Token = dict[str, Any]
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -46,8 +52,20 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
-    last_login_at TEXT
+    last_login_at TEXT,
+    is_service INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS api_tokens_user ON api_tokens (user_id);
 """
 
 
@@ -84,6 +102,15 @@ class Database:
             }
             if "created_by" not in columns:
                 conn.execute("ALTER TABLE builds ADD COLUMN created_by TEXT")
+            # Databases created before service accounts.
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(users)")
+            }
+            if "is_service" not in columns:
+                conn.execute(
+                    "ALTER TABLE users"
+                    " ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0"
+                )
 
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -258,12 +285,16 @@ class Database:
             )
         return cursor.rowcount
 
-    def create_user(self, email: str, role: str) -> User:
+    def create_user(
+        self, email: str, role: str, is_service: bool = False
+    ) -> User:
         """Adds a user.
 
         Args:
-            email: Email of the Google account, stored in lower case.
+            email: Email of the Google account, or name of the service
+                account, stored in lower case.
             role: Role of the user.
+            is_service: Whether the user is a service account.
 
         Returns:
             The new user record.
@@ -274,9 +305,9 @@ class Database:
         """
         with self._connect() as conn:
             row = conn.execute(
-                "INSERT INTO users (email, role, created_at)"
-                " VALUES (?, ?, ?) RETURNING *",
-                (email.lower(), role, now()),
+                "INSERT INTO users (email, role, created_at, is_service)"
+                " VALUES (?, ?, ?, ?) RETURNING *",
+                (email.lower(), role, now(), int(is_service)),
             ).fetchone()
         return dict(row)
 
@@ -352,7 +383,7 @@ class Database:
         return dict(row) if row else None
 
     def delete_user(self, user_id: int) -> bool:
-        """Removes a user.
+        """Removes a user and their API tokens.
 
         Args:
             user_id: Id of the user.
@@ -361,6 +392,7 @@ class Database:
             True if the user existed.
         """
         with self._connect() as conn:
+            conn.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
             cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         return cursor.rowcount > 0
 
@@ -389,3 +421,107 @@ class Database:
                 (google_sub, name, picture, now(), user_id),
             ).fetchone()
         return dict(row)
+
+    def create_token(
+        self,
+        user_id: int,
+        name: str,
+        prefix: str,
+        token_hash: str,
+        expires_at: str | None,
+    ) -> Token:
+        """Adds an API token.
+
+        Args:
+            user_id: Id of the user the token authenticates as.
+            name: What the token is for, as given by its creator.
+            prefix: Start of the token, shown to tell tokens apart.
+            token_hash: Hash of the token.
+            expires_at: When the token stops working, as an ISO 8601 UTC
+                string, or None if it does not expire.
+
+        Returns:
+            The new token record.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "INSERT INTO api_tokens"
+                " (user_id, name, prefix, token_hash, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
+                (user_id, name, prefix, token_hash, now(), expires_at),
+            ).fetchone()
+        return dict(row)
+
+    def get_token(self, token_id: int) -> Token | None:
+        """Looks up an API token by id.
+
+        Args:
+            token_id: Id of the token.
+
+        Returns:
+            The token record, or None if there is no such token.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_tokens WHERE id = ?", (token_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_token_by_hash(self, token_hash: str) -> Token | None:
+        """Looks up an API token by its hash.
+
+        Args:
+            token_hash: Hash of the token.
+
+        Returns:
+            The token record, or None if there is no such token.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_tokens WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_tokens(self, user_id: int) -> list[Token]:
+        """Lists the API tokens of a user.
+
+        Args:
+            user_id: Id of the user.
+
+        Returns:
+            The token records, newest first.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM api_tokens WHERE user_id = ?"
+                " ORDER BY created_at DESC, id DESC",
+                (user_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_token(self, token_id: int) -> bool:
+        """Removes an API token, revoking it.
+
+        Args:
+            token_id: Id of the token.
+
+        Returns:
+            True if the token existed.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM api_tokens WHERE id = ?", (token_id,)
+            )
+        return cursor.rowcount > 0
+
+    def touch_token(self, token_id: int) -> None:
+        """Records that an API token was just used.
+
+        Args:
+            token_id: Id of the token.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+                (now(), token_id),
+            )

@@ -9,8 +9,8 @@ Two processes sharing one `.env` and one data directory (`BUILDSERVER_DATA_DIR`,
 
 - `buildserver/api.py`: FastAPI app. `/api/builds` is the JSON API (upload, list, log, artifacts, cancel); `/` and `/ui/...` serve the front end.
 - `buildserver/worker.py`: single worker, one build at a time. Extracts the package, runs the build command, zips `bitfiles/generated/<name>/` plus the log.
-- `buildserver/auth.py`: Google OAuth sign-in (Authlib), session cookie, `current_user`/`admin_user` dependencies, `/api/me` and admin-only `/api/users` CRUD. All other routes require a signed-in user.
-- `buildserver/db.py`: SQLite `builds` table, which is also the task queue (oldest `queued` row is claimed), and `users` table.
+- `buildserver/auth.py`: Google OAuth sign-in (Authlib), session cookie, API tokens (`Authorization: Bearer bst_...`, sha256-hashed in the `api_tokens` table), service accounts (users with `is_service`, token-only), `current_user`/`session_user`/`admin_user` dependencies, `/api/me`, `/api/tokens` and admin-only `/api/users` CRUD. All other routes require a signed-in user or a token; creating tokens requires a session.
+- `buildserver/db.py`: SQLite `builds` table, which is also the task queue (oldest `queued` row is claimed), `users` and `api_tokens` tables.
 - `buildserver/storage.py`: on-disk layout and zip handling.
 - `buildserver/config.py`: settings from `BUILDSERVER_*` variables in `.env` (see `.env.template`); the real environment overrides the file. No paths are hardcoded in the code: every path setting is required and comes from `.env`.
 - `buildserver/templates/`: htmx front end. `index.html` is the page; the `_*.html` fragments are what `/ui/...` returns for htmx to swap in. No build step.

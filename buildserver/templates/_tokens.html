@@ -1,0 +1,68 @@
+<section id="tokens">
+  <h2>API tokens</h2>
+  <p class="muted small">
+    Scripts use a token as <code>Authorization: Bearer &lt;token&gt;</code>.
+    A token can do everything you can, except create further tokens.
+  </p>
+
+  {% if new_token %}
+  <div class="new-token">
+    <label>
+      New token (copy it now; it will not be shown again)
+      <input type="text" readonly value="{{ new_token }}" onfocus="this.select()">
+    </label>
+  </div>
+  {% endif %}
+
+  {% if tokens %}
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Token</th>
+        <th>Created</th>
+        <th>Expires</th>
+        <th>Last used</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tokens %}
+      <tr>
+        <td>{{ t.name }}</td>
+        <td><code>bst_{{ t.prefix }}…</code></td>
+        {# app.js rewrites <time> to the browser's local time #}
+        <td><time datetime="{{ t.created_at }}">{{ t.created_at[:19] | replace('T', ' ') }} UTC</time></td>
+        <td>{% if t.expires_at %}<time datetime="{{ t.expires_at }}">{{ t.expires_at[:19] | replace('T', ' ') }} UTC</time>{% else %}never{% endif %}</td>
+        <td>{% if t.last_used_at %}<time datetime="{{ t.last_used_at }}">{{ t.last_used_at[:19] | replace('T', ' ') }} UTC</time>{% else %}never{% endif %}</td>
+        <td class="actions">
+          <button type="button" hx-post="ui/tokens/{{ t.id }}/revoke" hx-target="#tokens" hx-swap="outerHTML"
+                  hx-confirm="Revoke token {{ t.name }}? Scripts using it will stop working.">Revoke</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No API tokens.</p>
+  {% endif %}
+
+  <form hx-post="ui/tokens" hx-target="#tokens" hx-swap="outerHTML" hx-disabled-elt="find button">
+    <label>
+      Token name
+      <input type="text" name="name" value="{{ name or '' }}" maxlength="64" required
+             placeholder="e.g. laptop, nightly CI">
+    </label>
+    <label>
+      Expires
+      <select name="expires_in_days">
+        <option value="30">in 30 days</option>
+        <option value="90" selected>in 90 days</option>
+        <option value="365">in 1 year</option>
+        <option value="">never</option>
+      </select>
+    </label>
+    <button type="submit">Create token</button>
+  </form>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+</section>

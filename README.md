@@ -54,7 +54,12 @@ Who may sign in:
 Everyone else is refused with a message on the sign-in page. Only verified Google
 emails are accepted. Users are `admin` or `user`; both can queue, cancel and
 download builds, only admins can manage users. Deactivating a user ends their
-session at once.
+session at once and stops their API tokens working.
+
+Robots (CI jobs, scripts not tied to a person) get a **service account**: a user
+an admin adds with `"is_service": true`, named instead of having an email. It
+cannot sign in with Google; it authenticates only with API tokens an admin
+creates for it (see below). Builds it queues show its name in `created_by`.
 
 ## Build packages
 
@@ -75,6 +80,43 @@ of a build that died in routing are still downloadable.
 
 ## API
 
+### Authentication
+
+Every route accepts either the session cookie set by signing in (so the
+interactive docs at `/docs` work in the browser) or an API token:
+
+```
+curl -H "Authorization: Bearer bst_..." http://localhost:8000/api/me
+curl -H "Authorization: Bearer bst_..." -F package=@proj.zip -F name=nightly \
+     http://localhost:8000/api/builds
+```
+
+Create a personal token in the *API tokens* section of the web page, or with
+`POST /api/tokens` while signed in. The token is shown once, at creation; only
+its hash is stored. A token acts as its user, with the same role, but cannot
+create further tokens. It stops working when revoked, when it expires (if
+created with an expiry), or when its user is deactivated or deleted. A request
+with an invalid `Authorization: Bearer` header is refused even if it also has a
+valid session. In `/docs`, *Authorize* takes a token.
+
+For a robot, an admin adds a service account and creates its token (both from a
+signed-in session, e.g. in `/docs`):
+
+```
+POST /api/users                {"email": "ci-nightly", "is_service": true}
+POST /api/users/{id}/tokens    {"name": "gitlab runner", "expires_in_days": 365}
+```
+
+| Method | Path | |
+| --- | --- | --- |
+| `GET` | `/api/tokens` | Your tokens (never the token itself) |
+| `POST` | `/api/tokens` | Create a token. JSON: `{"name": ..., "expires_in_days": 1-3650 \| null}`. Session only |
+| `DELETE` | `/api/tokens/{id}` | Revoke one of your tokens (admins: any token) |
+| `GET` | `/api/users/{id}/tokens` | A user's tokens (admins) |
+| `POST` | `/api/users/{id}/tokens` | Create a token for a user, e.g. a service account (admins, session only) |
+
+### Builds
+
 | Method | Path | |
 | --- | --- | --- |
 | `POST` | `/api/builds` | Upload a package. Multipart form: `package` (zip), optional `name` |
@@ -85,23 +127,21 @@ of a build that died in routing are still downloadable.
 | `POST` | `/api/builds/{id}/cancel` | Cancel a queued or running build |
 
 Status is one of `queued`, `running`, `succeeded`, `failed`, `cancelled`. Each
-build records the email of the user who queued it in `created_by`.
+build records the email (or service account name) of the user who queued it in
+`created_by`.
+
+### Users
 
 | Method | Path | |
 | --- | --- | --- |
-| `GET` | `/api/me` | The signed-in user |
+| `GET` | `/api/me` | The authenticated user |
 | `GET` | `/api/users` | List users (admins) |
-| `POST` | `/api/users` | Add a user. JSON: `{"email": ..., "role": "user" \| "admin"}` (admins) |
+| `POST` | `/api/users` | Add a user. JSON: `{"email": ..., "role": "user" \| "admin", "is_service": false}` (admins) |
 | `GET` | `/api/users/{id}` | One user (admins) |
 | `PATCH` | `/api/users/{id}` | Change `role` and/or `is_active` (admins) |
-| `DELETE` | `/api/users/{id}` | Remove a user; their builds are kept (admins) |
+| `DELETE` | `/api/users/{id}` | Remove a user and their tokens; their builds are kept (admins) |
 
 Admins cannot demote, deactivate or delete their own account.
-
-All routes authenticate with the session cookie set by signing in, so the API is
-easiest to use from the browser: the interactive docs at `/docs` work once you
-are signed in. There are no API tokens yet, so scripts (curl) cannot
-authenticate.
 
 The `/ui/...` routes return the HTML fragments the front end swaps into the page;
 they are not meant for clients.
