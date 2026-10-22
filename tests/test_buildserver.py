@@ -41,8 +41,8 @@ def make_package(script: str, prefix: str = "") -> bytes:
 
 
 @pytest.fixture
-def env(tmp_path):
-    """Provides settings, database, storage and an API client."""
+def env(tmp_path, auth_settings, sign_in):
+    """Provides settings, database, storage and a signed-in API client."""
     settings = config.Settings(
         data_dir=tmp_path,
         build_command=[sys.executable, "build.py", "{name}"],
@@ -51,7 +51,8 @@ def env(tmp_path):
     )
     store = storage.Storage(settings.data_dir)
     database = db.Database(store.db_path)
-    client = testclient.TestClient(api.create_app(settings))
+    client = testclient.TestClient(api.create_app(settings, auth_settings))
+    sign_in(client, "admin@example.com")
     return settings, database, store, client
 
 
@@ -75,6 +76,7 @@ def test_build_succeeds_and_artifacts_download(env):
     assert resp.status_code == 201
     build = resp.json()
     assert build["status"] == "queued" and not build["has_artifacts"]
+    assert build["created_by"] == "admin@example.com"
 
     assert worker.run_once(settings, database, store) is True
     assert worker.run_once(settings, database, store) is False

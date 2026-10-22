@@ -9,6 +9,10 @@
 <body>
   <header>
     <h1>Firmware build server</h1>
+    <form class="account" method="post" action="auth/logout">
+      <span>{{ user.email }}{% if user.role == 'admin' %} · admin{% endif %}</span>
+      <button type="submit">Sign out</button>
+    </form>
   </header>
 
   <main>

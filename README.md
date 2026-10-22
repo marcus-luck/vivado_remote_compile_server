@@ -8,6 +8,7 @@ a worker builds it, and the build artifacts are offered back as a zip.
 - **Task queue**: the `builds` table in SQLite (`buildserver/db.py`); queued rows are claimed oldest first
 - **Worker**: a separate process (`buildserver/worker.py`) that runs one build at a time
 - **Storage**: everything lives under the data directory (`buildserver/storage.py`)
+- **Users**: Google sign-in over OAuth, a `users` table, and a user management API (`buildserver/auth.py`)
 
 ## Running
 
@@ -24,8 +25,36 @@ The front end is at `http://<host>:8000/`, interactive API docs at `/docs`.
 Run a single worker: builds are serialised on purpose (Vivado is CPU, memory and
 licence bound), and a starting worker marks any build still `running` as failed.
 
-There is no authentication, and a build package runs arbitrary code on the build
-host. Only expose the server on a trusted network.
+Everything except the sign-in page requires a signed-in user. A build package
+still runs arbitrary code on the build host, so only give accounts to people you
+would trust with a shell on it.
+
+## Users and sign-in
+
+Users sign in with their Google account. Setup, once:
+
+1. In the Google Cloud console, APIs & Services > Credentials, create an OAuth
+   client ID of type *Web application*.
+2. Add `<BUILDSERVER_PUBLIC_URL>/auth/callback` as an authorised redirect URI,
+   e.g. `http://localhost:8000/auth/callback`.
+3. Put the client ID and secret, the public URL, a session secret and your own
+   Google account (as `BUILDSERVER_ADMIN_EMAILS`) in `.env`.
+
+Google only accepts `http://` redirect URIs for `localhost`. For other machines to
+sign in, serve the server under a host name over HTTPS (a reverse proxy in front of
+uvicorn, for example) and set `BUILDSERVER_PUBLIC_URL` to that address; bare IP
+addresses such as `http://192.168.x.x:8000` are refused by Google.
+
+Who may sign in:
+
+- accounts in `BUILDSERVER_ADMIN_EMAILS`: always, as administrators;
+- accounts an administrator added through `POST /api/users`;
+- if `BUILDSERVER_ALLOWED_DOMAINS` is set, any account of those domains, as a plain user.
+
+Everyone else is refused with a message on the sign-in page. Only verified Google
+emails are accepted. Users are `admin` or `user`; both can queue, cancel and
+download builds, only admins can manage users. Deactivating a user ends their
+session at once.
 
 ## Build packages
 
@@ -55,15 +84,27 @@ of a build that died in routing are still downloadable.
 | `GET` | `/api/builds/{id}/artifacts` | Artifact zip |
 | `POST` | `/api/builds/{id}/cancel` | Cancel a queued or running build |
 
-Status is one of `queued`, `running`, `succeeded`, `failed`, `cancelled`.
+Status is one of `queued`, `running`, `succeeded`, `failed`, `cancelled`. Each
+build records the email of the user who queued it in `created_by`.
+
+| Method | Path | |
+| --- | --- | --- |
+| `GET` | `/api/me` | The signed-in user |
+| `GET` | `/api/users` | List users (admins) |
+| `POST` | `/api/users` | Add a user. JSON: `{"email": ..., "role": "user" \| "admin"}` (admins) |
+| `GET` | `/api/users/{id}` | One user (admins) |
+| `PATCH` | `/api/users/{id}` | Change `role` and/or `is_active` (admins) |
+| `DELETE` | `/api/users/{id}` | Remove a user; their builds are kept (admins) |
+
+Admins cannot demote, deactivate or delete their own account.
+
+All routes authenticate with the session cookie set by signing in, so the API is
+easiest to use from the browser: the interactive docs at `/docs` work once you
+are signed in. There are no API tokens yet, so scripts (curl) cannot
+authenticate.
 
 The `/ui/...` routes return the HTML fragments the front end swaps into the page;
 they are not meant for clients.
-
-```
-curl -F "package=@hdsocv2.zip" -F "name=hdsocv2_v123" http://host:8000/api/builds
-curl -OJ http://host:8000/api/builds/<id>/artifacts
-```
 
 ## Configuration
 
@@ -85,6 +126,17 @@ Read by both processes:
 | `BUILDSERVER_BUILD_TIMEOUT` | default `21600` | Seconds before a build is killed |
 | `BUILDSERVER_MAX_UPLOAD_BYTES` | default `2147483648` | Upload size limit |
 | `BUILDSERVER_KEEP_WORKDIR` | default off | Set to `1` to keep the extracted package after the build |
+
+Read by the API server only:
+
+| Variable | | |
+| --- | --- | --- |
+| `BUILDSERVER_PUBLIC_URL` | required | URL users open the server at; the OAuth redirect URI is derived from it |
+| `BUILDSERVER_GOOGLE_CLIENT_ID` | required | Google OAuth client ID |
+| `BUILDSERVER_GOOGLE_CLIENT_SECRET` | required | Google OAuth client secret |
+| `BUILDSERVER_SESSION_SECRET` | required | Key that signs the session cookie |
+| `BUILDSERVER_ADMIN_EMAILS` | required | Comma-separated accounts that are always administrators |
+| `BUILDSERVER_ALLOWED_DOMAINS` | optional | Comma-separated domains whose accounts may sign in as plain users |
 
 On Windows keep the data directory path short: Vivado fails on paths over 260 characters.
 

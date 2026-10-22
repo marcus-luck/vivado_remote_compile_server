@@ -6,6 +6,8 @@ Run with:
 
 /api/... is the JSON API. / and /ui/... serve the front end: / is the full
 page, and the /ui/... routes return the HTML fragments htmx swaps into it.
+Sign-in and user management live in buildserver.auth; every route here except
+/ requires a signed-in user.
 """
 
 import datetime
@@ -20,7 +22,9 @@ from fastapi import responses
 from fastapi import staticfiles
 from fastapi import templating
 import markupsafe
+from starlette.middleware import sessions
 
+from buildserver import auth
 from buildserver import config
 from buildserver import db
 from buildserver import storage
@@ -76,20 +80,43 @@ def duration(build: db.Build) -> str:
     )
 
 
-def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
+def create_app(
+    settings: config.Settings | None = None,
+    auth_settings: config.AuthSettings | None = None,
+) -> fastapi.FastAPI:
     """Creates the FastAPI application.
+
+    Everything except the sign-in page and the static files requires a
+    signed-in user.
 
     Args:
         settings: The server settings. Loaded from the .env file and the
             environment if omitted.
+        auth_settings: The sign-in settings. Loaded from the .env file and
+            the environment if omitted.
 
     Returns:
         The application, serving the JSON API and the front end.
     """
     settings = settings or config.load_settings()
+    auth_settings = auth_settings or config.load_auth_settings()
     store = storage.Storage(settings.data_dir)
     database = db.Database(store.db_path)
     app = fastapi.FastAPI(title="Firmware build server")
+    app.state.database = database
+    app.state.oauth = auth.create_oauth(auth_settings)
+    app.add_middleware(
+        sessions.SessionMiddleware,
+        secret_key=auth_settings.session_secret,
+        same_site="lax",
+        https_only=auth_settings.public_url.startswith("https://"),
+    )
+    app.include_router(
+        auth.create_router(database, auth_settings, app.state.oauth)
+    )
+    protected = fastapi.APIRouter(
+        dependencies=[fastapi.Depends(auth.current_user)]
+    )
     templates = templating.Jinja2Templates(directory=_PACKAGE_DIR / "templates")
     templates.env.filters["duration"] = duration
 
@@ -111,13 +138,16 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
             raise fastapi.HTTPException(404, "build not found")
         return build
 
-    def store_upload(package: fastapi.UploadFile, name: str | None) -> db.Build:
+    def store_upload(
+        package: fastapi.UploadFile, name: str | None, user: db.User
+    ) -> db.Build:
         """Saves an uploaded package and queues a build for it.
 
         Args:
             package: The uploaded build package.
             name: Build name, or None or empty to derive it from the file name
                 of the package.
+            user: The user queueing the build.
 
         Returns:
             The new build record.
@@ -158,7 +188,7 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
         except BaseException:
             shutil.rmtree(build_dir, ignore_errors=True)
             raise
-        return database.create(build_id, name, filename)
+        return database.create(build_id, name, filename, user["email"])
 
     def read_log(build_id: str, tail: int) -> str:
         """Reads the end of a build log.
@@ -181,32 +211,33 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
 
     # JSON API ################################################################
 
-    @app.post("/api/builds", status_code=201)
+    @protected.post("/api/builds", status_code=201)
     def create_build(
         package: fastapi.UploadFile = fastapi.File(...),
         name: str | None = fastapi.Form(None),
+        user: db.User = fastapi.Depends(auth.current_user),
     ) -> db.Build:
         """Uploads a build package and queues a build for it."""
-        return present(store_upload(package, name))
+        return present(store_upload(package, name, user))
 
-    @app.get("/api/builds")
+    @protected.get("/api/builds")
     def list_builds(limit: int = 200) -> list[db.Build]:
         """Lists the most recent builds, newest first."""
         return [present(build) for build in database.list_builds(limit)]
 
-    @app.get("/api/builds/{build_id}")
+    @protected.get("/api/builds/{build_id}")
     def get_build(build_id: str) -> db.Build:
         """Returns one build."""
         return present(get_or_404(build_id))
 
-    @app.post("/api/builds/{build_id}/cancel")
+    @protected.post("/api/builds/{build_id}/cancel")
     def cancel_build(build_id: str) -> db.Build:
         """Cancels a queued or running build."""
         get_or_404(build_id)
         database.request_cancel(build_id)
         return present(get_or_404(build_id))
 
-    @app.get(
+    @protected.get(
         "/api/builds/{build_id}/log", response_class=responses.PlainTextResponse
     )
     def get_log(build_id: str, tail: int = _LOG_TAIL_BYTES) -> str:
@@ -214,7 +245,7 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
         get_or_404(build_id)
         return read_log(build_id, tail)
 
-    @app.get("/api/builds/{build_id}/artifacts")
+    @protected.get("/api/builds/{build_id}/artifacts")
     def download_artifacts(build_id: str) -> responses.FileResponse:
         """Downloads the artifacts of a build as a zip archive."""
         build = get_or_404(build_id)
@@ -231,23 +262,29 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
 
     @app.get("/", response_class=responses.HTMLResponse)
     def ui_index(request: fastapi.Request) -> responses.Response:
-        """Serves the front end page."""
+        """Serves the front end page, or the sign-in page."""
+        user = auth.optional_user(request)
+        if user is None:
+            return templates.TemplateResponse(
+                request, "login.html", {"error": auth.pop_login_error(request)}
+            )
         return templates.TemplateResponse(
-            request, "index.html", {"builds": present_all()}
+            request, "index.html", {"builds": present_all(), "user": user}
         )
 
-    @app.get("/ui/builds", response_class=responses.HTMLResponse)
+    @protected.get("/ui/builds", response_class=responses.HTMLResponse)
     def ui_builds(request: fastapi.Request) -> responses.Response:
         """Serves the build table fragment."""
         return templates.TemplateResponse(
             request, "_builds.html", {"builds": present_all()}
         )
 
-    @app.post("/ui/builds", response_class=responses.HTMLResponse)
+    @protected.post("/ui/builds", response_class=responses.HTMLResponse)
     def ui_create_build(
         request: fastapi.Request,
         package: fastapi.UploadFile = fastapi.File(...),
         name: str = fastapi.Form(""),
+        user: db.User = fastapi.Depends(auth.current_user),
     ) -> responses.Response:
         """Queues a build from the upload form and serves the form again.
 
@@ -255,7 +292,7 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
         htmx does not swap in 4xx responses.
         """
         try:
-            store_upload(package, name)
+            store_upload(package, name, user)
         except fastapi.HTTPException as e:
             return templates.TemplateResponse(
                 request, "_form.html", {"name": name, "error": e.detail}
@@ -264,7 +301,7 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
             request, "_form.html", {}, headers={"HX-Trigger": "refresh"}
         )
 
-    @app.post(
+    @protected.post(
         "/ui/builds/{build_id}/cancel", response_class=responses.HTMLResponse
     )
     def ui_cancel_build(
@@ -276,7 +313,9 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
             request, "_builds.html", {"builds": present_all()}
         )
 
-    @app.get("/ui/builds/{build_id}/log", response_class=responses.HTMLResponse)
+    @protected.get(
+        "/ui/builds/{build_id}/log", response_class=responses.HTMLResponse
+    )
     def ui_log(request: fastapi.Request, build_id: str) -> responses.Response:
         """Serves the log panel fragment of a build."""
         build = get_or_404(build_id)
@@ -286,7 +325,7 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
             {"build": build, "text": read_log(build_id, _LOG_TAIL_BYTES)},
         )
 
-    @app.get(
+    @protected.get(
         "/ui/builds/{build_id}/log/text", response_class=responses.HTMLResponse
     )
     def ui_log_text(build_id: str) -> responses.Response:
@@ -302,6 +341,7 @@ def create_app(settings: config.Settings | None = None) -> fastapi.FastAPI:
             status_code=200 if active else _HTMX_STOP_POLLING,
         )
 
+    app.include_router(protected)
     app.mount(
         "/static",
         staticfiles.StaticFiles(directory=_PACKAGE_DIR / "static"),

@@ -1,7 +1,7 @@
-"""SQLite-backed build records.
+"""SQLite-backed build and user records.
 
 The builds table doubles as the task queue: the worker claims the oldest row
-whose status is QUEUED.
+whose status is QUEUED. The users table holds the accounts that may sign in.
 """
 
 from collections.abc import Iterator
@@ -13,6 +13,8 @@ from typing import Any
 
 # A row of the builds table, keyed by column name.
 Build = dict[str, Any]
+# A row of the users table, keyed by column name.
+User = dict[str, Any]
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -31,9 +33,21 @@ CREATE TABLE IF NOT EXISTS builds (
     finished_at TEXT,
     exit_code INTEGER,
     error TEXT,
-    cancel_requested INTEGER NOT NULL DEFAULT 0
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT
 );
 CREATE INDEX IF NOT EXISTS builds_status ON builds (status, created_at);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT,
+    picture TEXT,
+    google_sub TEXT UNIQUE,
+    role TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    last_login_at TEXT
+);
 """
 
 
@@ -45,7 +59,7 @@ def now() -> str:
 
 
 class Database:
-    """Access to the build records.
+    """Access to the build and user records.
 
     Every method opens its own connection, so one instance can be shared
     between threads, and the API and worker processes can each have their own.
@@ -64,6 +78,12 @@ class Database:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            # Databases created before builds recorded who queued them.
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(builds)")
+            }
+            if "created_by" not in columns:
+                conn.execute("ALTER TABLE builds ADD COLUMN created_by TEXT")
 
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -83,7 +103,13 @@ class Database:
         finally:
             conn.close()
 
-    def create(self, build_id: str, name: str, package_filename: str) -> Build:
+    def create(
+        self,
+        build_id: str,
+        name: str,
+        package_filename: str,
+        created_by: str | None = None,
+    ) -> Build:
         """Adds a build to the queue.
 
         Args:
@@ -91,6 +117,7 @@ class Database:
             name: Build name, passed to the build command.
             package_filename: File name of the uploaded package, as given by
                 the client.
+            created_by: Email of the user who queued the build.
 
         Returns:
             The new build record.
@@ -98,9 +125,9 @@ class Database:
         with self._connect() as conn:
             row = conn.execute(
                 "INSERT INTO builds"
-                " (id, name, status, package_filename, created_at)"
-                " VALUES (?, ?, ?, ?, ?) RETURNING *",
-                (build_id, name, QUEUED, package_filename, now()),
+                " (id, name, status, package_filename, created_at, created_by)"
+                " VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
+                (build_id, name, QUEUED, package_filename, now(), created_by),
             ).fetchone()
         return dict(row)
 
@@ -230,3 +257,135 @@ class Database:
                 ),
             )
         return cursor.rowcount
+
+    def create_user(self, email: str, role: str) -> User:
+        """Adds a user.
+
+        Args:
+            email: Email of the Google account, stored in lower case.
+            role: Role of the user.
+
+        Returns:
+            The new user record.
+
+        Raises:
+            sqlite3.IntegrityError: If there already is a user with that
+                email.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "INSERT INTO users (email, role, created_at)"
+                " VALUES (?, ?, ?) RETURNING *",
+                (email.lower(), role, now()),
+            ).fetchone()
+        return dict(row)
+
+    def get_user(self, user_id: int) -> User | None:
+        """Looks up a user by id.
+
+        Args:
+            user_id: Id of the user.
+
+        Returns:
+            The user record, or None if there is no such user.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_email(self, email: str) -> User | None:
+        """Looks up a user by email, ignoring case.
+
+        Args:
+            email: Email of the user.
+
+        Returns:
+            The user record, or None if there is no such user.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE email = ?", (email,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self) -> list[User]:
+        """Lists all users.
+
+        Returns:
+            The user records, ordered by email.
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM users ORDER BY email").fetchall()
+        return [dict(row) for row in rows]
+
+    def update_user(
+        self,
+        user_id: int,
+        role: str | None = None,
+        is_active: bool | None = None,
+    ) -> User | None:
+        """Changes the role or the active flag of a user.
+
+        Args:
+            user_id: Id of the user.
+            role: New role, or None to leave it unchanged.
+            is_active: New active flag, or None to leave it unchanged.
+
+        Returns:
+            The updated user record, or None if there is no such user.
+        """
+        with self._connect() as conn:
+            if role is not None:
+                conn.execute(
+                    "UPDATE users SET role = ? WHERE id = ?", (role, user_id)
+                )
+            if is_active is not None:
+                conn.execute(
+                    "UPDATE users SET is_active = ? WHERE id = ?",
+                    (int(is_active), user_id),
+                )
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_user(self, user_id: int) -> bool:
+        """Removes a user.
+
+        Args:
+            user_id: Id of the user.
+
+        Returns:
+            True if the user existed.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return cursor.rowcount > 0
+
+    def record_login(
+        self,
+        user_id: int,
+        google_sub: str | None,
+        name: str | None,
+        picture: str | None,
+    ) -> User:
+        """Stores the Google profile of a user who just signed in.
+
+        Args:
+            user_id: Id of the user.
+            google_sub: Google's stable identifier of the account.
+            name: Display name of the account.
+            picture: URL of the profile picture of the account.
+
+        Returns:
+            The updated user record.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE users SET google_sub = ?, name = ?, picture = ?,"
+                " last_login_at = ? WHERE id = ? RETURNING *",
+                (google_sub, name, picture, now(), user_id),
+            ).fetchone()
+        return dict(row)

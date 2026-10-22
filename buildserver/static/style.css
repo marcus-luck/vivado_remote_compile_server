@@ -23,7 +23,15 @@ header {
   color: #fff;
 }
 
+header { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+header .account { display: flex; align-items: center; gap: 12px; font-size: 13px; }
+header .account button { padding: 4px 10px; }
+
 h1 { margin: 0; font-size: 18px; font-weight: 600; }
+
+.signin { max-width: 420px; margin: 48px auto; }
+.signin p { margin: 0 0 16px; }
+a.button.primary { display: inline-block; background: var(--accent); border-color: var(--accent); color: #fff; }
 h2 { margin: 0 0 12px; font-size: 15px; display: flex; gap: 8px; align-items: center; }
 
 main { max-width: 1200px; margin: 0 auto; padding: 16px 24px; }

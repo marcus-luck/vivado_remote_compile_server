@@ -7,6 +7,7 @@
       <th>Queued</th>
       <th>Duration</th>
       <th>Package</th>
+      <th>By</th>
       <th></th>
     </tr>
   </thead>
@@ -22,6 +23,7 @@
       <td><time datetime="{{ b.created_at }}">{{ b.created_at[:19] | replace('T', ' ') }} UTC</time></td>
       <td>{{ b | duration }}</td>
       <td>{{ b.package_filename }}</td>
+      <td>{{ b.created_by or '' }}</td>
       <td class="actions">
         {% if b.started_at %}
         <button type="button" hx-get="ui/builds/{{ b.id }}/log" hx-target="#log">Log</button>

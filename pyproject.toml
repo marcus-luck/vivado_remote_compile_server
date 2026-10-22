@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Firmware build server: upload a build package, queue it, build it, download the artifacts."
 requires-python = ">=3.11"
 dependencies = [
+    "authlib>=1.8.0",
     "fastapi>=0.115",
+    "httpx>=0.28.1",
+    "itsdangerous>=2.2.0",
     "jinja2>=3.1.6",
     "python-dotenv>=1.2.4",
     "python-multipart>=0.0.9",

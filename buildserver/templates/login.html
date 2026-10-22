@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Firmware build server</title>
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Firmware build server</h1>
+  </header>
+
+  <main>
+    <section class="signin">
+      <h2>Sign in</h2>
+      <p>Use your Google account to queue builds and download artifacts.</p>
+      <a class="button primary" href="auth/login">Sign in with Google</a>
+      {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    </section>
+  </main>
+</body>
+</html>
