@@ -33,8 +33,14 @@ before finishing a change.
 
 ## Commands
 
+Served as `https://buildserver.drystone.solutions` (local DNS only): Caddy
+(`deploy/Caddyfile`, Cloudflare DNS challenge, token in git-ignored
+`deploy/caddy.env`) proxies to uvicorn on 127.0.0.1:8000. Google sign-in needs
+HTTPS, so don't expose uvicorn directly.
+
 ```
-uv run uvicorn --factory buildserver.api:create_app --port 8000
+uv run uvicorn --factory buildserver.api:create_app --host 127.0.0.1 --port 8000
+caddy run --config deploy/Caddyfile --envfile deploy/caddy.env
 uv run python -m buildserver.worker
 uv run pytest
 uv run ruff format .

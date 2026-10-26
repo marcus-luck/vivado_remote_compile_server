@@ -41,9 +41,41 @@ Users sign in with their Google account. Setup, once:
    Google account (as `BUILDSERVER_ADMIN_EMAILS`) in `.env`.
 
 Google only accepts `http://` redirect URIs for `localhost`. For other machines to
-sign in, serve the server under a host name over HTTPS (a reverse proxy in front of
-uvicorn, for example) and set `BUILDSERVER_PUBLIC_URL` to that address; bare IP
-addresses such as `http://192.168.x.x:8000` are refused by Google.
+sign in, serve the server under a host name over HTTPS and set
+`BUILDSERVER_PUBLIC_URL` to that address; bare IP addresses such as
+`http://192.168.x.x:8000` are refused by Google. See below.
+
+### HTTPS on the local network
+
+`deploy/Caddyfile` puts Caddy in front of uvicorn as the HTTPS endpoint for
+`buildserver.drystone.solutions`, a name the local DNS server resolves to the
+build host. The name is not reachable from the internet, so Caddy gets its
+Let's Encrypt certificate through a DNS challenge on Cloudflare, which hosts the
+`drystone.solutions` zone.
+
+1. Get Caddy with the Cloudflare DNS module (the plain release lacks it). The
+   download service at caddyserver.com builds it on demand but can stall; with
+   Go installed, build it instead:
+   `go run github.com/caddyserver/xcaddy/cmd/xcaddy@latest build --with github.com/caddy-dns/cloudflare`
+   On the current build host it is `%LOCALAPPDATA%\Programs\Caddy\caddy.exe`.
+2. Create a Cloudflare API token from the *Edit zone DNS* template for the
+   `drystone.solutions` zone. Copy `deploy/caddy.env.template` to
+   `deploy/caddy.env` and put the token there. Keep it out of `.env`: variables
+   in `.env` are passed on to build commands.
+3. Add `https://buildserver.drystone.solutions/auth/callback` to the OAuth
+   client's authorised redirect URIs in Google Cloud.
+4. In `.env`, set `BUILDSERVER_PUBLIC_URL=https://buildserver.drystone.solutions`.
+5. Allow inbound TCP 443 in Windows Firewall (admin PowerShell):
+   `New-NetFirewallRule -DisplayName "Build server HTTPS" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -Profile Private`
+6. Run uvicorn on loopback only, so all traffic goes through Caddy, and start
+   Caddy from the repository root:
+
+   ```
+   uv run uvicorn --factory buildserver.api:create_app --host 127.0.0.1 --port 8000
+   caddy run --config deploy/Caddyfile --envfile deploy/caddy.env
+   ```
+
+Caddy renews the certificate by itself.
 
 Who may sign in:
 
