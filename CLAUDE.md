@@ -20,12 +20,11 @@ Two processes sharing one `.env` and one data directory (`BUILDSERVER_DATA_DIR`,
 - `buildserver/templates/`: htmx front end. `index.html` is the page; the `_*.html` fragments are what `/ui/...` returns for htmx to swap in. No build step.
 - `buildserver/static/`: stylesheet, vendored htmx, a few lines of JS.
 
-## Progress tracking
+## Review agent
 
-Tasks live in the ClickUp list FW_build_server; use the `clickup-tasks` skill
-(`.claude/skills/clickup-tasks/`) to list, add, start and check them off. Hooks
-in `.claude/settings.json` (script `.claude/hooks/clickup_tasks.py`) ask for a
-task list at session start and for task updates after replies that edit files.
+`.claude/agents/uncle-bob.md`: read-only reviewer in the persona of Uncle Bob
+(Clean Code, SOLID, TDD, Clean Architecture). Use it for reviews, refactoring
+advice and design questions; it proposes changes, it does not make them.
 
 ## Style
 
