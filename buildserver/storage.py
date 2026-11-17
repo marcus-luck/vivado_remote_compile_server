@@ -8,10 +8,14 @@ Layout:
     <data_dir>/builds/<id>/artifacts.zip  build artifacts
     <data_dir>/work/<id>/                 extracted package, removed after the
                                           build
+
+The retention pass of the worker deletes the package and artifacts of old
+builds; their logs stay.
 """
 
 import os
 import pathlib
+import shutil
 import zipfile
 
 
@@ -60,6 +64,23 @@ class Storage:
     def work_dir(self, build_id: str) -> pathlib.Path:
         """Returns the directory a build's package is extracted to."""
         return self.work_root / build_id
+
+    def expire_files(self, build_id: str) -> None:
+        """Deletes the package and artifacts of a build, keeping its log.
+
+        Args:
+            build_id: Id of the build.
+
+        Raises:
+            OSError: If a file cannot be deleted, for example because a
+                download holds it open on Windows.
+        """
+        self.package_path(build_id).unlink(missing_ok=True)
+        self.artifacts_path(build_id).unlink(missing_ok=True)
+
+    def delete_build_dir(self, build_id: str) -> None:
+        """Deletes all files of a build. Files that cannot be deleted stay."""
+        shutil.rmtree(self.build_dir(build_id), ignore_errors=True)
 
 
 def extract_package(zip_path: pathlib.Path, dest: pathlib.Path) -> None:

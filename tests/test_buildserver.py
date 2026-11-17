@@ -3,6 +3,8 @@
 A small Python script stands in for build.tcl and Vivado.
 """
 
+import dataclasses
+import datetime
 import io
 import os
 import sys
@@ -231,6 +233,7 @@ def test_settings_come_from_env_file(tmp_path, monkeypatch):
         "BUILDSERVER_ARTIFACT_DIR=out/{name}\n"
         "BUILDSERVER_BUILD_TIMEOUT=120\n"
         "BUILDSERVER_KEEP_WORKDIR=1\n"
+        "BUILDSERVER_RETENTION_DAYS=14\n"
         "XILINXD_LICENSE_FILE=2100@host\n"
     )
     settings = config.load_settings()
@@ -242,6 +245,7 @@ def test_settings_come_from_env_file(tmp_path, monkeypatch):
     assert settings.build_script == "build.tcl"
     assert settings.artifact_dir == "out/{name}"
     assert settings.keep_workdir is True
+    assert settings.retention_days == 14
     assert settings.build_timeout == 60  # the real environment wins over .env
     assert (
         os.environ["XILINXD_LICENSE_FILE"] == "2100@host"
@@ -342,3 +346,91 @@ def test_ui_log_polls_until_build_is_over(env):
         in client.get(f"/ui/builds/{build['id']}/log").text
     )
     assert "Download" not in client.get("/ui/builds").text
+
+
+def other_client(client, sign_in, email: str = "dev@team.example.com"):
+    """Returns a second client of the same app, signed in as another user."""
+    other = testclient.TestClient(client.app)
+    sign_in(other, email)
+    return other
+
+
+def test_creator_deletes_build_with_its_files(env, sign_in):
+    settings, database, store, client = env
+    mine = other_client(client, sign_in)
+    build = upload(mine, make_package(GOOD_BUILD)).json()
+    worker.run_once(settings, database, store)
+    assert store.build_dir(build["id"]).is_dir()
+
+    assert mine.delete(f"/api/builds/{build['id']}").status_code == 204
+    assert mine.get(f"/api/builds/{build['id']}").status_code == 404
+    assert not store.build_dir(build["id"]).exists()
+    assert mine.delete(f"/api/builds/{build['id']}").status_code == 404
+
+
+def test_only_creator_or_admin_deletes(env, sign_in):
+    _, _, _, admin = env
+    build = upload(other_client(admin, sign_in), make_package(GOOD_BUILD))
+    build_id = build.json()["id"]
+    stranger = other_client(admin, sign_in, "eve@team.example.com")
+    assert stranger.delete(f"/api/builds/{build_id}").status_code == 403
+    assert "Delete</button>" not in stranger.get("/ui/builds").text
+
+    assert "Delete</button>" in admin.get("/ui/builds").text
+    assert admin.delete(f"/api/builds/{build_id}").status_code == 204
+
+
+def test_deleted_queued_build_is_not_run(env):
+    settings, database, store, client = env
+    build = upload(client, make_package(GOOD_BUILD)).json()
+    assert client.delete(f"/api/builds/{build['id']}").status_code == 204
+    assert worker.run_once(settings, database, store) is False
+
+
+def test_running_build_cannot_be_deleted(env):
+    _, database, store, client = env
+    build = upload(client, make_package(GOOD_BUILD)).json()
+    database.claim_next()
+    resp = client.delete(f"/api/builds/{build['id']}")
+    assert resp.status_code == 409
+    assert store.package_path(build["id"]).is_file()
+    assert "Delete</button>" not in client.get("/ui/builds").text
+
+
+def test_ui_delete(env):
+    _, _, _, client = env
+    ui_upload(client, make_package(GOOD_BUILD), name="doomed")
+    build = client.get("/api/builds").json()[0]
+    assert "Delete</button>" in client.get("/ui/builds").text
+    table = client.post(f"/ui/builds/{build['id']}/delete").text
+    assert "doomed" not in table and "No builds yet." in table
+
+
+def test_retention_expires_old_files_and_keeps_log(env):
+    settings, database, store, client = env
+    old = upload(client, make_package(GOOD_BUILD), name="old").json()
+    worker.run_once(settings, database, store)
+    later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        days=2
+    )
+    recent = upload(client, make_package(GOOD_BUILD), name="new").json()
+
+    # Disabled by default.
+    assert worker.expire_old_files(settings, database, store, later) == 0
+
+    settings = dataclasses.replace(settings, retention_days=1)
+    # The recent build is still queued, so it has no finish time yet.
+    assert worker.expire_old_files(settings, database, store, later) == 1
+    assert not store.package_path(old["id"]).exists()
+    assert not store.artifacts_path(old["id"]).exists()
+    assert store.log_path(old["id"]).is_file()
+    old = client.get(f"/api/builds/{old['id']}").json()
+    assert old["files_expired_at"] and not old["has_artifacts"]
+    assert old["status"] == "succeeded"
+    assert "files expired" in client.get("/ui/builds").text
+    assert client.get(f"/api/builds/{old['id']}/log").text
+
+    worker.run_once(settings, database, store)
+    assert worker.expire_old_files(settings, database, store) == 0
+    assert store.artifacts_path(recent["id"]).is_file()
+    assert store.package_path(recent["id"]).is_file()

@@ -27,6 +27,8 @@
 
     <div id="log"></div>
 
+    {% with error = github_message %}{% include "_repos.html" %}{% endwith %}
+
     {% include "_tokens.html" %}
   </main>
 

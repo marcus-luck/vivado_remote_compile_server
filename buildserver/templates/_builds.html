@@ -22,7 +22,15 @@
       {# app.js rewrites <time> to the browser's local time #}
       <td><time datetime="{{ b.created_at }}">{{ b.created_at[:19] | replace('T', ' ') }} UTC</time></td>
       <td>{{ b | duration }}</td>
-      <td>{{ b.package_filename }}</td>
+      <td>
+        {% if b.repo_full_name %}
+        {{ b.repo_full_name }}
+        <div class="muted small">{% if b.ref_type == 'tag' %}tag {% endif %}{{ b.ref }}{% if b.commit_sha %} @ <code title="{{ b.commit_sha }}">{{ b.commit_sha[:8] }}</code>{% endif %}</div>
+        {% else %}
+        {{ b.package_filename }}
+        {% endif %}
+        {% if b.files_expired_at %}<div class="muted small">files expired</div>{% endif %}
+      </td>
       <td>{{ b.created_by or '' }}</td>
       <td class="actions">
         {% if b.started_at %}
@@ -34,6 +42,10 @@
         {% if b.status == 'queued' or (b.status == 'running' and not b.cancel_requested) %}
         <button type="button" hx-post="ui/builds/{{ b.id }}/cancel" hx-target="#builds"
                 hx-confirm="Cancel build {{ b.name }}?">Cancel</button>
+        {% endif %}
+        {% if b.can_delete and b.status != 'running' %}
+        <button type="button" hx-post="ui/builds/{{ b.id }}/delete" hx-target="#builds"
+                hx-confirm="Delete build {{ b.name }} and its files?">Delete</button>
         {% endif %}
       </td>
     </tr>

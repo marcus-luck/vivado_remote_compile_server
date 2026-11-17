@@ -5,6 +5,7 @@ Run with:
     python -m buildserver.worker
 """
 
+import datetime
 import logging
 import os
 import pathlib
@@ -16,6 +17,7 @@ from typing import BinaryIO
 
 from buildserver import config
 from buildserver import db
+from buildserver import git
 from buildserver import storage
 
 _logger = logging.getLogger("buildserver.worker")
@@ -42,6 +44,73 @@ def kill_tree(process: subprocess.Popen) -> None:
         except ProcessLookupError:
             pass
     process.wait()
+
+
+def _run_process(
+    command: list[str],
+    cwd: pathlib.Path,
+    env: dict[str, str] | None,
+    timeout: float,
+    database: db.Database,
+    build: db.Build,
+    logfile: BinaryIO,
+) -> tuple[str, int | None, str | None]:
+    """Runs a command of a build and waits for it to end.
+
+    The command is killed if the build is cancelled or the command exceeds
+    the timeout.
+
+    Args:
+        command: The command, as a list of arguments. Written to the log, so
+            it must not hold secrets.
+        cwd: Directory to run the command in.
+        env: Environment of the command, or None for the worker's own.
+        timeout: Seconds the command may run.
+        database: The build records, polled for a cancel request.
+        build: The build being run.
+        logfile: Open log file that receives the output of the command.
+
+    Returns:
+        A tuple (status, exit_code, error): SUCCEEDED, FAILED or CANCELLED,
+        the exit code of the command (None if it was killed or never
+        started), and a reason for a failure (None otherwise).
+    """
+    logfile.write(f"[buildserver] running: {' '.join(command)}\n".encode())
+    logfile.flush()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=logfile,
+            stderr=subprocess.STDOUT,
+            start_new_session=os.name != "nt",
+        )
+    except OSError as e:
+        return db.FAILED, None, f"could not start {command[0]}: {e}"
+
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                exit_code = process.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if database.cancel_requested(build["id"]):
+                kill_tree(process)
+                return db.CANCELLED, None, None
+            if time.monotonic() > deadline:
+                kill_tree(process)
+                return db.FAILED, None, f"timed out after {timeout:.0f} s"
+    finally:
+        if process.poll() is None:
+            kill_tree(process)
+
+    if exit_code != 0:
+        return db.FAILED, exit_code, f"exited with code {exit_code}"
+    return db.SUCCEEDED, exit_code, None
 
 
 def run_command(
@@ -72,49 +141,101 @@ def run_command(
         argument.replace(config.NAME_PLACEHOLDER, build["name"])
         for argument in settings.build_command
     ]
-    logfile.write(f"[buildserver] running: {' '.join(command)}\n".encode())
-    logfile.flush()
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=logfile,
-            stderr=subprocess.STDOUT,
-            start_new_session=os.name != "nt",
-        )
-    except OSError as e:
-        return db.FAILED, None, f"could not start build command: {e}"
+    status, exit_code, error = _run_process(
+        command, cwd, None, settings.build_timeout, database, build, logfile
+    )
+    return status, exit_code, error and f"build command {error}"
 
-    deadline = time.monotonic() + settings.build_timeout
-    try:
-        while True:
-            try:
-                exit_code = process.wait(timeout=1)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            if database.cancel_requested(build["id"]):
-                kill_tree(process)
-                return db.CANCELLED, None, None
-            if time.monotonic() > deadline:
-                kill_tree(process)
-                return (
-                    db.FAILED,
-                    None,
-                    f"build timed out after {settings.build_timeout:.0f} s",
-                )
-    finally:
-        if process.poll() is None:
-            kill_tree(process)
 
-    if exit_code != 0:
+def clone_repo(
+    settings: config.Settings,
+    database: db.Database,
+    build: db.Build,
+    dest: pathlib.Path,
+    logfile: BinaryIO,
+) -> tuple[str, str | None]:
+    """Clones the branch or tag of a build from a repository.
+
+    The clone uses the GitHub token of the user recorded as the build's
+    source, and counts against the build timeout like the build itself.
+
+    Args:
+        settings: The server settings.
+        database: The records, for the token and for a cancel request.
+        build: The build being run; its repo_full_name is set.
+        dest: Directory to clone into; must not exist.
+        logfile: Open log file that receives git's output.
+
+    Returns:
+        A tuple (status, error): SUCCEEDED, FAILED or CANCELLED, and a
+        reason for a failure (None otherwise).
+    """
+    link = database.get_github_link(build["source_user_id"])
+    if link is None:
+        owner = database.get_user(build["source_user_id"])
+        who = owner["email"] if owner else "the repository's owner"
+        return db.FAILED, f"GitHub account of {who} is not linked"
+    command = git.clone_command(
+        settings.git, build["repo_full_name"], build["ref"], dest
+    )
+    status, _, error = _run_process(
+        command,
+        dest.parent,
+        git.clone_env(link["access_token"]),
+        settings.build_timeout,
+        database,
+        build,
+        logfile,
+    )
+    if status != db.SUCCEEDED:
+        return status, error and f"git clone {error}"
+    database.set_commit(build["id"], git.head_commit(settings.git, dest))
+    return db.SUCCEEDED, None
+
+
+def prepare_source(
+    settings: config.Settings,
+    database: db.Database,
+    store: storage.Storage,
+    build: db.Build,
+    logfile: BinaryIO,
+) -> tuple[pathlib.Path | None, str, str | None]:
+    """Puts the source of a build in its work directory.
+
+    The source is the uploaded package, extracted, or a clone of the
+    repository.
+
+    Args:
+        settings: The server settings.
+        database: The records.
+        store: The data directory.
+        build: The build being run.
+        logfile: Open log file of the build.
+
+    Returns:
+        A tuple (root, status, error): the directory holding the build
+        script, or None if the build cannot go on; and, when it cannot, the
+        status (FAILED or CANCELLED) and the reason.
+    """
+    work_dir = store.work_dir(build["id"])
+    shutil.rmtree(work_dir, ignore_errors=True)
+    if build["repo_full_name"]:
+        status, error = clone_repo(settings, database, build, work_dir, logfile)
+        if status != db.SUCCEEDED:
+            return None, status, error
+        source = "repository"
+    else:
+        storage.extract_package(store.package_path(build["id"]), work_dir)
+        source = "package"
+    root = storage.find_build_root(work_dir, settings.build_script)
+    if root is None:
         return (
+            None,
             db.FAILED,
-            exit_code,
-            f"build command exited with code {exit_code}",
+            f"{settings.build_script} not found at the top level of the"
+            f" {source}",
         )
-    return db.SUCCEEDED, exit_code, None
+    return root, db.SUCCEEDED, None
 
 
 def run_build(
@@ -144,15 +265,10 @@ def run_build(
         with open(log_path, "wb") as logfile:
             # One failing build must not take the worker down.
             try:
-                shutil.rmtree(work_dir, ignore_errors=True)
-                storage.extract_package(store.package_path(build_id), work_dir)
-                root = storage.find_build_root(work_dir, settings.build_script)
-                if root is None:
-                    error = (
-                        f"{settings.build_script} not found at the top level"
-                        " of the package"
-                    )
-                else:
+                root, status, error = prepare_source(
+                    settings, database, store, build, logfile
+                )
+                if root is not None:
                     status, exit_code, error = run_command(
                         settings, database, build, root, logfile
                     )
@@ -220,6 +336,51 @@ def run_once(
     return True
 
 
+def expire_old_files(
+    settings: config.Settings,
+    database: db.Database,
+    store: storage.Storage,
+    now: datetime.datetime | None = None,
+) -> int:
+    """Deletes the package and artifacts of builds past the retention period.
+
+    The build records and logs stay. A build whose files cannot be deleted
+    is left as it is and tried again on the next pass.
+
+    Args:
+        settings: The server settings.
+        database: The build records.
+        store: The data directory.
+        now: The current time, in UTC. Defaults to the clock.
+
+    Returns:
+        The number of builds whose files were deleted.
+    """
+    if settings.retention_days <= 0:
+        return 0
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(days=settings.retention_days)
+    expired = 0
+    # Same format as db.now(), so the timestamps compare as strings.
+    cutoff_text = cutoff.isoformat(timespec="milliseconds")
+    for build in database.list_expirable(cutoff_text):
+        try:
+            store.expire_files(build["id"])
+        except OSError as e:
+            _logger.warning(
+                "could not delete files of build %s: %s", build["id"], e
+            )
+            continue
+        database.set_files_expired(build["id"])
+        _logger.info(
+            "deleted package and artifacts of build %s (%s)",
+            build["id"],
+            build["name"],
+        )
+        expired += 1
+    return expired
+
+
 def main() -> None:
     """Runs the worker until it is interrupted."""
     logging.basicConfig(
@@ -232,12 +393,19 @@ def main() -> None:
     if interrupted:
         _logger.warning("marked %d interrupted build(s) as failed", interrupted)
     _logger.info(
-        "worker ready, data dir %s, command %s",
+        "worker ready, data dir %s, command %s, %s",
         settings.data_dir,
         settings.build_command,
+        f"build files kept {settings.retention_days:g} days"
+        if settings.retention_days > 0
+        else "build files kept forever",
     )
+    next_expiry = time.monotonic()
     try:
         while True:
+            if time.monotonic() >= next_expiry:
+                expire_old_files(settings, database, store)
+                next_expiry = time.monotonic() + settings.retention_interval
             if not run_once(settings, database, store):
                 time.sleep(settings.poll_interval)
     except KeyboardInterrupt:

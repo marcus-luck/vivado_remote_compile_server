@@ -12,9 +12,14 @@ signed in. Robots get service accounts: users an administrator adds, which
 cannot sign in with Google and use only the tokens an administrator creates
 for them. Tokens cannot be used to create tokens.
 
+A signed-in user can link a GitHub account, through a GitHub OAuth App, to
+build from its repositories (see buildserver.repos). Linking needs a session,
+not a token.
+
 Routes:
 
     /auth/login, /auth/callback, /auth/logout   sign-in flow
+    /auth/github/...                            linking a GitHub account
     /api/me                                     the authenticated user
     /api/tokens...                              the user's own API tokens
     /api/users...                               user management, admins only
@@ -36,6 +41,7 @@ import pydantic
 
 from buildserver import config
 from buildserver import db
+from buildserver import github
 
 ROLE_ADMIN = "admin"
 ROLE_USER = "user"
@@ -49,6 +55,12 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SERVICE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _SESSION_USER_ID = "user_id"
 _SESSION_LOGIN_ERROR = "login_error"
+_SESSION_GITHUB_MESSAGE = "github_message"
+_GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+_GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+# Reading private repositories needs the full "repo" scope; OAuth Apps have no
+# read-only scope for them.
+_GITHUB_SCOPE = "repo"
 
 TOKEN_PREFIX = "bst_"
 # Characters after TOKEN_PREFIX that are stored to tell tokens apart.
@@ -335,6 +347,11 @@ def pop_login_error(request: fastapi.Request) -> str | None:
     return request.session.pop(_SESSION_LOGIN_ERROR, None)
 
 
+def pop_github_message(request: fastapi.Request) -> str | None:
+    """Returns, once, why the last attempt to link or unlink GitHub failed."""
+    return request.session.pop(_SESSION_GITHUB_MESSAGE, None)
+
+
 def resolve_sign_in(
     database: db.Database,
     auth_settings: config.AuthSettings,
@@ -386,13 +403,14 @@ def resolve_sign_in(
 
 
 def create_oauth(auth_settings: config.AuthSettings) -> starlette_client.OAuth:
-    """Creates the OAuth client registry with Google registered.
+    """Creates the OAuth client registry with Google and GitHub registered.
 
     Args:
         auth_settings: The sign-in settings.
 
     Returns:
-        The registry. Its `google` attribute is the Google client.
+        The registry. Its `google` attribute is the Google client, and its
+        `github` attribute the GitHub client if GitHub is configured.
     """
     oauth = starlette_client.OAuth()
     oauth.register(
@@ -402,6 +420,15 @@ def create_oauth(auth_settings: config.AuthSettings) -> starlette_client.OAuth:
         server_metadata_url=_GOOGLE_METADATA_URL,
         client_kwargs={"scope": "openid email profile"},
     )
+    if auth_settings.github_enabled:
+        oauth.register(
+            name="github",
+            client_id=auth_settings.github_client_id,
+            client_secret=auth_settings.github_client_secret,
+            authorize_url=_GITHUB_AUTHORIZE_URL,
+            access_token_url=_GITHUB_TOKEN_URL,
+            client_kwargs={"scope": _GITHUB_SCOPE},
+        )
     return oauth
 
 
@@ -422,6 +449,7 @@ def create_router(
     """
     router = fastapi.APIRouter()
     redirect_uri = f"{auth_settings.public_url}/auth/callback"
+    github_redirect_uri = f"{auth_settings.public_url}/auth/github/callback"
     home_url = f"{auth_settings.public_url}/"
 
     def get_or_404(user_id: int) -> db.User:
@@ -468,6 +496,88 @@ def create_router(
         request.session.clear()
         return responses.RedirectResponse(home_url, status_code=303)
 
+    # Linking GitHub ##########################################################
+
+    def require_github() -> None:
+        """Raises a 503 if no GitHub OAuth App is configured."""
+        if not auth_settings.github_enabled:
+            raise fastapi.HTTPException(503, "GitHub is not configured")
+
+    @router.get("/auth/github/login", include_in_schema=False)
+    async def github_login(
+        request: fastapi.Request,
+        user: db.User = fastapi.Depends(session_user),
+    ) -> responses.Response:
+        """Sends the browser to GitHub to link an account."""
+        del user  # Only required to be signed in.
+        require_github()
+        return await oauth.github.authorize_redirect(
+            request, github_redirect_uri
+        )
+
+    @router.get("/auth/github/callback", include_in_schema=False)
+    async def github_callback(request: fastapi.Request) -> responses.Response:
+        """Stores the link when GitHub sends the browser back."""
+        require_github()
+        user = optional_user(request)
+        if user is None:
+            return responses.RedirectResponse(home_url, status_code=303)
+        try:
+            token = await oauth.github.authorize_access_token(request)
+        except starlette_client.OAuthError as e:
+            request.session[_SESSION_GITHUB_MESSAGE] = (
+                f"Linking GitHub failed: {e.description or e.error}"
+            )
+            return responses.RedirectResponse(home_url, status_code=303)
+        try:
+            account = github.get_user(
+                request.app.state.github_http, token["access_token"]
+            )
+        except github.GitHubError as e:
+            request.session[_SESSION_GITHUB_MESSAGE] = (
+                f"Linking GitHub failed: {e.message}"
+            )
+            return responses.RedirectResponse(home_url, status_code=303)
+        try:
+            database.set_github_link(
+                user["id"],
+                account["id"],
+                account["login"],
+                token["access_token"],
+                token.get("scope"),
+            )
+        except sqlite3.IntegrityError:
+            request.session[_SESSION_GITHUB_MESSAGE] = (
+                f"GitHub account {account['login']} is already linked to"
+                " another user."
+            )
+        return responses.RedirectResponse(home_url, status_code=303)
+
+    @router.post("/auth/github/unlink", include_in_schema=False)
+    def github_unlink(
+        request: fastapi.Request,
+        user: db.User = fastapi.Depends(session_user),
+    ) -> responses.Response:
+        """Unlinks the user's GitHub account and revokes its token."""
+        link = database.get_github_link(user["id"])
+        if link is not None:
+            if auth_settings.github_enabled:
+                try:
+                    github.revoke_grant(
+                        request.app.state.github_http,
+                        auth_settings.github_client_id,
+                        auth_settings.github_client_secret,
+                        link["access_token"],
+                    )
+                except github.GitHubError as e:
+                    request.session[_SESSION_GITHUB_MESSAGE] = (
+                        "Unlinked, but GitHub did not confirm revoking the"
+                        f" token ({e.message}); revoke it in your GitHub"
+                        " settings."
+                    )
+            database.delete_github_link(user["id"])
+        return responses.RedirectResponse(home_url, status_code=303)
+
     # API tokens ##############################################################
 
     @router.get("/api/tokens")
@@ -507,7 +617,11 @@ def create_router(
         user: db.User = fastapi.Depends(current_user),
     ) -> dict[str, Any]:
         """Returns the authenticated user."""
-        return present_user(user)
+        link = database.get_github_link(user["id"])
+        return {
+            **present_user(user),
+            "github_login": link["login"] if link else None,
+        }
 
     admins_only = [fastapi.Depends(admin_user)]
 

@@ -1,0 +1,22 @@
+{% if error %}
+<p class="error">{{ error }}</p>
+{% elif results %}
+<ul class="picker">
+  {% for r in results %}
+  <li>
+    <span>
+      {{ r.full_name }}{% if r.private %} <span class="muted small">private</span>{% endif %}
+      {% if r.description %}<div class="muted small">{{ r.description }}</div>{% endif %}
+    </span>
+    {% if r.full_name.lower() in connected %}
+    <span class="muted small">added</span>
+    {% else %}
+    <button type="button" hx-post="ui/repos" hx-vals='{"repo": "{{ r.full_name }}"}'
+            hx-target="#repos" hx-swap="outerHTML" hx-disabled-elt="this">Add</button>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted small">No matching repositories.</p>
+{% endif %}

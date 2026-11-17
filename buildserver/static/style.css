@@ -51,6 +51,17 @@ input[type="text"]:invalid { border-color: var(--error); }
 select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; font: inherit; }
 
 #tokens table { margin-bottom: 16px; }
+#repos table { margin-bottom: 16px; }
+.github-account { margin-bottom: 12px; }
+.github-account, .github-account form { display: flex; align-items: center; gap: 12px; }
+button.plain { background: #fff; border-color: var(--border); color: var(--text); }
+.add-repo { display: flex; flex-direction: column; gap: 12px; }
+input[type="search"] { width: 360px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; font: inherit; }
+ul.picker { list-style: none; margin: 0; padding: 0; max-width: 640px; max-height: 280px; overflow: auto; border: 1px solid var(--border); border-radius: 4px; }
+ul.picker:empty { display: none; }
+ul.picker li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+ul.picker li:last-child { border-bottom: 0; }
+.message { color: #1b6b34; margin: 8px 0; }
 .new-token { margin-bottom: 16px; padding: 12px; background: #d9f0df; border-radius: 4px; }
 .new-token input[type="text"] { width: 100%; font-family: Consolas, "Cascadia Mono", monospace; }
 progress { width: 160px; height: 30px; }

@@ -12,7 +12,6 @@ here except / requires a signed-in user or an API token.
 
 import datetime
 import pathlib
-import re
 import shutil
 import uuid
 import zipfile
@@ -28,30 +27,16 @@ from starlette.middleware import sessions
 from buildserver import auth
 from buildserver import config
 from buildserver import db
+from buildserver import github
+from buildserver import names
+from buildserver import repos
 from buildserver import storage
-
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 _PACKAGE_DIR = pathlib.Path(__file__).parent
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _LOG_TAIL_BYTES = 64 * 1024
 # htmx stops polling an element when a response has this status.
 _HTMX_STOP_POLLING = 286
-
-
-def default_name(filename: str) -> str:
-    """Derives a build name from the file name of an uploaded package.
-
-    Args:
-        filename: File name of the package, as given by the client.
-
-    Returns:
-        The file name without its extension, reduced to the characters allowed
-        in a build name, or "build" if nothing usable is left.
-    """
-    stem = pathlib.Path(filename).stem
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).lstrip("._-")[:64]
-    return name or "build"
 
 
 def duration(build: db.Build) -> str:
@@ -106,6 +91,7 @@ def create_app(
     app = fastapi.FastAPI(title="Firmware build server")
     app.state.database = database
     app.state.oauth = auth.create_oauth(auth_settings)
+    app.state.github_http = github.create_client()
     app.add_middleware(
         sessions.SessionMiddleware,
         secret_key=auth_settings.session_secret,
@@ -128,9 +114,34 @@ def create_app(
         build["has_artifacts"] = store.artifacts_path(build["id"]).is_file()
         return build
 
-    def present_all() -> list[db.Build]:
-        """Returns the recent builds as they are shown to clients."""
-        return [present(build) for build in database.list_builds()]
+    def can_delete(build: db.Build, user: db.User) -> bool:
+        """Tells whether a user may delete a build: its creator or an admin."""
+        return (
+            user["role"] == auth.ROLE_ADMIN
+            or build["created_by"] == user["email"]
+        )
+
+    def present_all(user: db.User) -> list[db.Build]:
+        """Returns the recent builds as they are shown in the build table.
+
+        Args:
+            user: The user viewing the table.
+
+        Returns:
+            The builds, each with can_delete set for that user.
+        """
+        return [
+            {**present(build), "can_delete": can_delete(build, user)}
+            for build in database.list_builds()
+        ]
+
+    def builds_fragment(
+        request: fastapi.Request, user: db.User
+    ) -> responses.Response:
+        """Serves the build table fragment for a user."""
+        return templates.TemplateResponse(
+            request, "_builds.html", {"builds": present_all(user)}
+        )
 
     def get_or_404(build_id: str) -> db.Build:
         """Returns a build record, or raises a 404 if there is none."""
@@ -138,6 +149,27 @@ def create_app(
         if build is None:
             raise fastapi.HTTPException(404, "build not found")
         return build
+
+    def delete_build_or_raise(build_id: str, user: db.User) -> None:
+        """Deletes a build record and all its files.
+
+        Args:
+            build_id: Id of the build.
+            user: The user deleting the build.
+
+        Raises:
+            fastapi.HTTPException: If there is no such build (404), the user
+                is neither its creator nor an admin (403), or it is running
+                (409).
+        """
+        build = get_or_404(build_id)
+        if not can_delete(build, user):
+            raise fastapi.HTTPException(
+                403, "only the build's creator or an admin can delete it"
+            )
+        if not database.delete_build(build_id):
+            raise fastapi.HTTPException(409, "cancel the running build first")
+        store.delete_build_dir(build_id)
 
     def store_upload(
         package: fastapi.UploadFile, name: str | None, user: db.User
@@ -158,13 +190,9 @@ def create_app(
                 is too large (413) or the package is not a zip archive (400).
         """
         filename = package.filename or "package.zip"
-        name = name or default_name(filename)
-        if not NAME_RE.fullmatch(name):
-            raise fastapi.HTTPException(
-                422,
-                "name must be 1-64 characters of A-Z a-z 0-9 . _ - and start"
-                " with a letter or digit",
-            )
+        name = name or names.default_name(filename)
+        if not names.NAME_RE.fullmatch(name):
+            raise fastapi.HTTPException(422, names.NAME_ERROR)
 
         build_id = uuid.uuid4().hex[:12]
         build_dir = store.build_dir(build_id)
@@ -238,6 +266,13 @@ def create_app(
         database.request_cancel(build_id)
         return present(get_or_404(build_id))
 
+    @protected.delete("/api/builds/{build_id}", status_code=204)
+    def delete_build(
+        build_id: str, user: db.User = fastapi.Depends(auth.current_user)
+    ) -> None:
+        """Deletes a build that is not running, with its files."""
+        delete_build_or_raise(build_id, user)
+
     @protected.get(
         "/api/builds/{build_id}/log", response_class=responses.PlainTextResponse
     )
@@ -273,18 +308,21 @@ def create_app(
             request,
             "index.html",
             {
-                "builds": present_all(),
+                "builds": present_all(user),
                 "user": user,
                 "tokens": database.list_tokens(user["id"]),
+                **repos.page_context(database, auth_settings, user),
+                "github_message": auth.pop_github_message(request),
             },
         )
 
     @protected.get("/ui/builds", response_class=responses.HTMLResponse)
-    def ui_builds(request: fastapi.Request) -> responses.Response:
+    def ui_builds(
+        request: fastapi.Request,
+        user: db.User = fastapi.Depends(auth.current_user),
+    ) -> responses.Response:
         """Serves the build table fragment."""
-        return templates.TemplateResponse(
-            request, "_builds.html", {"builds": present_all()}
-        )
+        return builds_fragment(request, user)
 
     @protected.post("/ui/builds", response_class=responses.HTMLResponse)
     def ui_create_build(
@@ -312,13 +350,32 @@ def create_app(
         "/ui/builds/{build_id}/cancel", response_class=responses.HTMLResponse
     )
     def ui_cancel_build(
-        request: fastapi.Request, build_id: str
+        request: fastapi.Request,
+        build_id: str,
+        user: db.User = fastapi.Depends(auth.current_user),
     ) -> responses.Response:
         """Cancels a build and serves the build table fragment."""
         database.request_cancel(build_id)
-        return templates.TemplateResponse(
-            request, "_builds.html", {"builds": present_all()}
-        )
+        return builds_fragment(request, user)
+
+    @protected.post(
+        "/ui/builds/{build_id}/delete", response_class=responses.HTMLResponse
+    )
+    def ui_delete_build(
+        request: fastapi.Request,
+        build_id: str,
+        user: db.User = fastapi.Depends(auth.current_user),
+    ) -> responses.Response:
+        """Deletes a build and serves the build table fragment.
+
+        The table only offers Delete where it is allowed, so a refusal (the
+        build started running meanwhile, say) just shows the table again.
+        """
+        try:
+            delete_build_or_raise(build_id, user)
+        except fastapi.HTTPException:
+            pass
+        return builds_fragment(request, user)
 
     @protected.get(
         "/ui/builds/{build_id}/log", response_class=responses.HTMLResponse
@@ -414,6 +471,9 @@ def create_app(
         return tokens_fragment(request, user)
 
     app.include_router(protected)
+    app.include_router(
+        repos.create_router(database, store, auth_settings, templates, present)
+    )
     app.mount(
         "/static",
         staticfiles.StaticFiles(directory=_PACKAGE_DIR / "static"),

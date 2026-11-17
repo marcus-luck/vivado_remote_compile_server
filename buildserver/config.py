@@ -33,6 +33,10 @@ class Settings:
         max_upload_bytes: Largest accepted build package, in bytes.
         keep_workdir: Whether to keep the extracted package after the build.
         poll_interval: Seconds the worker sleeps when the queue is empty.
+        git: Git executable, used to clone repositories for builds.
+        retention_days: Days after a build finishes before its package and
+            artifacts are deleted; 0 keeps them forever.
+        retention_interval: Seconds between the worker's retention passes.
     """
 
     data_dir: pathlib.Path
@@ -43,6 +47,9 @@ class Settings:
     max_upload_bytes: int = 2 * 1024**3
     keep_workdir: bool = False
     poll_interval: float = 2.0
+    git: str = "git"
+    retention_days: float = 0
+    retention_interval: float = 3600
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,6 +66,9 @@ class AuthSettings:
             how the first administrator gets in.
         allowed_domains: Email domains whose Google accounts may sign in
             without being added by an administrator first.
+        github_client_id: Client id of the GitHub OAuth App users link their
+            GitHub accounts through, or empty if GitHub is not configured.
+        github_client_secret: Client secret of the GitHub OAuth App.
     """
 
     public_url: str
@@ -67,6 +77,13 @@ class AuthSettings:
     session_secret: str
     admin_emails: frozenset[str]
     allowed_domains: frozenset[str] = frozenset()
+    github_client_id: str = ""
+    github_client_secret: str = ""
+
+    @property
+    def github_enabled(self) -> bool:
+        """Whether users can link GitHub accounts and build repositories."""
+        return bool(self.github_client_id and self.github_client_secret)
 
 
 def _load_env_file() -> None:
@@ -153,6 +170,10 @@ def load_settings() -> Settings:
             or defaults["max_upload_bytes"]
         ),
         keep_workdir=env.get("BUILDSERVER_KEEP_WORKDIR", "") not in ("", "0"),
+        git=env.get("BUILDSERVER_GIT") or defaults["git"],
+        retention_days=float(
+            env.get("BUILDSERVER_RETENTION_DAYS") or defaults["retention_days"]
+        ),
     )
 
 
@@ -174,5 +195,9 @@ def load_auth_settings() -> AuthSettings:
         admin_emails=_split(_require("BUILDSERVER_ADMIN_EMAILS")),
         allowed_domains=_split(
             os.environ.get("BUILDSERVER_ALLOWED_DOMAINS", "")
+        ),
+        github_client_id=os.environ.get("BUILDSERVER_GITHUB_CLIENT_ID", ""),
+        github_client_secret=os.environ.get(
+            "BUILDSERVER_GITHUB_CLIENT_SECRET", ""
         ),
     )

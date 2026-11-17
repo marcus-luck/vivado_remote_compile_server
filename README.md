@@ -9,6 +9,7 @@ a worker builds it, and the build artifacts are offered back as a zip.
 - **Worker**: a separate process (`buildserver/worker.py`) that runs one build at a time
 - **Storage**: everything lives under the data directory (`buildserver/storage.py`)
 - **Users**: Google sign-in over OAuth, a `users` table, and a user management API (`buildserver/auth.py`)
+- **Repositories**: users link a GitHub account and build branches or tags of its repositories (`buildserver/repos.py`, `github.py`, `git.py`)
 
 ## Running
 
@@ -97,7 +98,8 @@ creates for it (see below). Builds it queues show its name in `created_by`.
 
 A package is a zip of the project with `build.tcl` at its top level (or inside a
 single top-level folder). Include everything the build reads, submodules too
-(`gige_core_udp_rgmii`, `_SOURCE/common_firmware`, ...); the server does not run git.
+(`gige_core_udp_rgmii`, `_SOURCE/common_firmware`, ...). To build straight from
+git instead, connect the repository (see below).
 
 The worker extracts the package and runs, in that directory:
 
@@ -109,6 +111,60 @@ which matches the `build.tcl` convention of the firmware projects: output goes t
 `bitfiles/generated/<build name>/`. That directory, plus `build.log`, becomes the
 artifact zip. It is collected for failed builds as well, so timing and DRC reports
 of a build that died in routing are still downloadable.
+
+## Deleting builds and retention
+
+*Delete* in the build table (or `DELETE /api/builds/{id}`) removes a build and
+all its files. Only the user who queued it, or an admin, can delete a build; a
+running build has to be cancelled first.
+
+With `BUILDSERVER_RETENTION_DAYS` set, the worker deletes the package and the
+artifact zip of every build that finished more than that many days ago. It
+checks at start-up and then hourly, between builds. The build stays in the list
+with its log and is marked *files expired*. Unset or `0` keeps files forever.
+
+## Repositories and GitHub
+
+Instead of uploading a package, a user can link their GitHub account and
+connect repositories of it. Each connected repository has a selected branch or
+tag; *Build* queues a build of it, *Update* refetches the branches and tags from
+GitHub, *Delete* disconnects it (its builds are kept). The worker makes a
+shallow clone of the branch tip or the tagged commit, with submodules, and
+builds it like an extracted package: `build.tcl` must be at the top of the
+repository. The build records the commit it built.
+
+Repositories are per user: you see the ones you connected, admins see all.
+A build of someone else's repository by an admin still clones with the token of
+the repository's owner.
+
+Setup, once:
+
+1. On GitHub, Settings > Developer settings > OAuth Apps > New OAuth App. Set
+   the callback URL to `<BUILDSERVER_PUBLIC_URL>/auth/github/callback`, e.g.
+   `https://buildserver.drystone.solutions/auth/github/callback`. A host name
+   only the local network resolves is fine: GitHub only redirects the browser.
+2. Put its client ID and a client secret in `.env` as
+   `BUILDSERVER_GITHUB_CLIENT_ID` and `BUILDSERVER_GITHUB_CLIENT_SECRET`, and
+   restart the API server.
+3. If the repositories belong to an organisation that restricts OAuth Apps, an
+   organisation owner has to approve the app (GitHub asks on the consent page).
+
+Users then press *Connect GitHub* in the *Repositories* section, and add
+repositories by searching their own or pasting a URL (`https://github.com/owner/repo`,
+`git@github.com:owner/repo.git` or `owner/repo`).
+
+**What the token can do.** OAuth Apps have no read-only scope for private
+repositories, so the link asks for `repo`: read *and write* access to every
+repository the user can reach. The token is stored in the database. The worker
+passes it to git through environment variables only, so it is not written to
+`.git/config`, the build log or the build command's environment; but builds run
+uploaded code as the same Windows user that can read the database. *Unlink*
+deletes the token and revokes it at GitHub. Linking requires a signed-in
+session; an API token cannot link an account.
+
+Submodules are fetched with the same token. Submodule URLs on GitHub may use
+https or SSH (`git@github.com:...` is rewritten to https); submodules hosted
+elsewhere are not supported, since git is only allowed to use https.
 
 ## API
 
@@ -157,10 +213,30 @@ POST /api/users/{id}/tokens    {"name": "gitlab runner", "expires_in_days": 365}
 | `GET` | `/api/builds/{id}/log?tail=65536` | Build log as text (`tail=0` for all of it) |
 | `GET` | `/api/builds/{id}/artifacts` | Artifact zip |
 | `POST` | `/api/builds/{id}/cancel` | Cancel a queued or running build |
+| `DELETE` | `/api/builds/{id}` | Delete a build and its files: its creator or an admin; 409 while running |
 
 Status is one of `queued`, `running`, `succeeded`, `failed`, `cancelled`. Each
 build records the email (or service account name) of the user who queued it in
-`created_by`.
+`created_by`. A build from a repository has an empty `package_filename` and
+sets `repo_full_name`, `ref`, `ref_type` (`branch` or `tag`) and, once cloned,
+`commit_sha`. `files_expired_at` is set once retention has deleted the
+package and artifacts.
+
+### Repositories
+
+| Method | Path | |
+| --- | --- | --- |
+| `GET` | `/api/github/repos?q=` | Repositories the linked GitHub account can read, filtered by `q` |
+| `GET` | `/api/repos` | Your connected repositories (admins: everybody's) |
+| `POST` | `/api/repos` | Connect one. JSON: `{"repo": <URL or owner/repo>, "name": ...}`. The default branch is selected |
+| `GET` | `/api/repos/{id}` | One repository, with its `branches` and `tags` |
+| `POST` | `/api/repos/{id}/fetch` | Refetch branches and tags from GitHub |
+| `PATCH` | `/api/repos/{id}` | Select what to build. JSON: `{"ref": ..., "ref_type": "branch" \| "tag"}` |
+| `DELETE` | `/api/repos/{id}` | Disconnect; builds are kept |
+| `POST` | `/api/repos/{id}/builds` | Queue a build. Optional JSON: `{"name": ..., "ref": ..., "ref_type": ...}`; defaults are the repository's name and selected ref |
+
+Linking is done in the browser: `/auth/github/login` and `POST /auth/github/unlink`.
+`/api/me` shows the linked account as `github_login`.
 
 ### Users
 
@@ -198,6 +274,8 @@ Read by both processes:
 | `BUILDSERVER_BUILD_TIMEOUT` | default `21600` | Seconds before a build is killed |
 | `BUILDSERVER_MAX_UPLOAD_BYTES` | default `2147483648` | Upload size limit |
 | `BUILDSERVER_KEEP_WORKDIR` | default off | Set to `1` to keep the extracted package after the build |
+| `BUILDSERVER_GIT` | default `git` | Git executable the worker clones repositories with |
+| `BUILDSERVER_RETENTION_DAYS` | default off | Days after a build finishes before the worker deletes its package and artifacts (the log stays) |
 
 Read by the API server only:
 
@@ -209,6 +287,8 @@ Read by the API server only:
 | `BUILDSERVER_SESSION_SECRET` | required | Key that signs the session cookie |
 | `BUILDSERVER_ADMIN_EMAILS` | required | Comma-separated accounts that are always administrators |
 | `BUILDSERVER_ALLOWED_DOMAINS` | optional | Comma-separated domains whose accounts may sign in as plain users |
+| `BUILDSERVER_GITHUB_CLIENT_ID` | optional | Client ID of the GitHub OAuth App; enables repositories |
+| `BUILDSERVER_GITHUB_CLIENT_SECRET` | optional | Client secret of the GitHub OAuth App |
 
 On Windows keep the data directory path short: Vivado fails on paths over 260 characters.
 
@@ -218,7 +298,8 @@ On Windows keep the data directory path short: Vivado fails on paths over 260 ch
 uv run pytest
 ```
 
-The tests use a small Python script in place of Vivado.
+The tests use a small Python script in place of Vivado, a fake of the GitHub
+API, and local git repositories in place of github.com (git must be on PATH).
 
 ## Style
 
