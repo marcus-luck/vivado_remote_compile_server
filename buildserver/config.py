@@ -39,6 +39,10 @@ class Settings:
         retention_interval: Seconds between the worker's retention passes.
         token_key: Key the GitHub tokens are encrypted with in the database
             (see buildserver.crypto); empty if GitHub is not used.
+        work_dir: Directory the builds' work directories are made in, or None
+            for data_dir/work.
+        build_user: Account the build command runs as (see
+            buildserver.sandbox), or empty to run it as the worker's own.
     """
 
     data_dir: pathlib.Path
@@ -53,6 +57,8 @@ class Settings:
     retention_days: float = 0
     retention_interval: float = 3600
     token_key: str = dataclasses.field(default="", repr=False)
+    work_dir: pathlib.Path | None = None
+    build_user: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -134,8 +140,9 @@ def load_settings() -> Settings:
 
     Raises:
         ValueError: If a required variable is missing,
-            BUILDSERVER_BUILD_COMMAND is not a JSON list of strings, or a
-            numeric variable does not hold a number.
+            BUILDSERVER_BUILD_COMMAND is not a JSON list of strings, a
+            numeric variable does not hold a number, or
+            BUILDSERVER_BUILD_USER is set on Windows.
     """
     _load_env_file()
     env = os.environ
@@ -179,7 +186,34 @@ def load_settings() -> Settings:
             env.get("BUILDSERVER_RETENTION_DAYS") or defaults["retention_days"]
         ),
         token_key=env.get("BUILDSERVER_TOKEN_KEY", ""),
+        work_dir=(
+            pathlib.Path(env["BUILDSERVER_WORK_DIR"]).resolve()
+            if env.get("BUILDSERVER_WORK_DIR")
+            else None
+        ),
+        build_user=_build_user(env.get("BUILDSERVER_BUILD_USER", "")),
     )
+
+
+def _build_user(name: str) -> str:
+    """Checks the BUILDSERVER_BUILD_USER setting.
+
+    Args:
+        name: The configured account name, possibly empty.
+
+    Returns:
+        The account name, or an empty string.
+
+    Raises:
+        ValueError: If an account is set on Windows, where running the build
+            as another account is not supported.
+    """
+    if name and os.name == "nt":
+        raise ValueError(
+            "BUILDSERVER_BUILD_USER is only supported on Linux (see the"
+            " Docker deployment in README.md)"
+        )
+    return name
 
 
 def load_auth_settings() -> AuthSettings:

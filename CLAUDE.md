@@ -14,6 +14,7 @@ Two processes sharing one `.env` and one data directory (`BUILDSERVER_DATA_DIR`,
 - `buildserver/github.py`: the GitHub REST calls (user, repos, branches, tags, revoke), over an `httpx.Client` kept on `app.state.github_http`.
 - `buildserver/git.py`: the clone command and its environment. The token goes to git only through `GIT_CONFIG_*` environment variables, never a URL, command line or log.
 - `buildserver/names.py`: valid build names and defaults.
+- `buildserver/sandbox.py`: with `BUILDSERVER_BUILD_USER` (Linux), the build command runs as that account through `sudo -n -u <user> -- env -i ... sh -c 'umask 002; exec "$@"'`, with a fresh home `<work_root>/<id>.home`. Killing is `sudo -u <user> kill -KILL -1`. Before and after each build the worker kills the account's processes, deletes its temp files and empties the work root (`BUILDSERVER_WORK_DIR`, outside the data dir). `tests/test_sandbox.py` fakes sudo; its `sandbox` tests need the worker image.
 - `buildserver/crypto.py`: Fernet encryption of the GitHub tokens in `github_links` (`BUILDSERVER_TOKEN_KEY`; `db.Database` takes the cipher, encrypts on write, decrypts on read, migrates plaintext rows on open). The build command gets `worker.build_env()`: the environment without `BUILDSERVER_*` and `GIT_CONFIG_*`.
 - `buildserver/db.py`: SQLite `builds` table, which is also the task queue (oldest `queued` row is claimed), `users`, `api_tokens`, `github_links` and `repos` tables.
 - `buildserver/storage.py`: on-disk layout and zip handling.

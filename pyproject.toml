@@ -49,3 +49,6 @@ known-first-party = ["buildserver"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "sandbox: needs the Linux worker image with the build account (BUILDSERVER_TEST_SANDBOX=1)",
+]

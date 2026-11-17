@@ -19,6 +19,7 @@ from buildserver import config
 from buildserver import crypto
 from buildserver import db
 from buildserver import git
+from buildserver import sandbox
 from buildserver import storage
 
 _logger = logging.getLogger("buildserver.worker")
@@ -101,6 +102,8 @@ def _run_process(
     database: db.Database,
     build: db.Build,
     logfile: BinaryIO,
+    run_as: str = "",
+    home: pathlib.Path | None = None,
 ) -> tuple[str, int | None, str | None]:
     """Runs a command of a build and waits for it to end.
 
@@ -116,6 +119,9 @@ def _run_process(
         database: The build records, polled for a cancel request.
         build: The build being run.
         logfile: Open log file that receives the output of the command.
+        run_as: Account to run the command as (see buildserver.sandbox), or
+            empty for the worker's own.
+        home: Home directory of the command when run_as is set.
 
     Returns:
         A tuple (status, exit_code, error): SUCCEEDED, FAILED or CANCELLED,
@@ -124,9 +130,22 @@ def _run_process(
     """
     logfile.write(f"[buildserver] running: {' '.join(command)}\n".encode())
     logfile.flush()
+    argv = command
+    if run_as:
+        argv = sandbox.wrap(command, run_as, home, env or {})
+        env = None  # sudo starts the command with a clean environment.
+
+    def kill(process: subprocess.Popen) -> None:
+        """Kills the command with everything it started."""
+        if run_as:
+            sandbox.kill_all(run_as)
+            process.wait()
+        else:
+            kill_tree(process)
+
     try:
         process = subprocess.Popen(
-            command,
+            argv,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -146,14 +165,14 @@ def _run_process(
             except subprocess.TimeoutExpired:
                 pass
             if database.cancel_requested(build["id"]):
-                kill_tree(process)
+                kill(process)
                 return db.CANCELLED, None, None
             if time.monotonic() > deadline:
-                kill_tree(process)
+                kill(process)
                 return db.FAILED, None, f"timed out after {timeout:.0f} s"
     finally:
         if process.poll() is None:
-            kill_tree(process)
+            kill(process)
 
     if exit_code != 0:
         return db.FAILED, exit_code, f"exited with code {exit_code}"
@@ -182,6 +201,7 @@ def build_env() -> dict[str, str]:
 def run_command(
     settings: config.Settings,
     database: db.Database,
+    store: storage.Storage,
     build: db.Build,
     cwd: pathlib.Path,
     logfile: BinaryIO,
@@ -189,11 +209,13 @@ def run_command(
     """Runs the build command and waits for it to end.
 
     The command is killed if the build is cancelled or exceeds the build
-    timeout.
+    timeout. With a build account configured, it runs as that account, with
+    the build's fresh home directory.
 
     Args:
         settings: The server settings.
         database: The build records, polled for a cancel request.
+        store: The data directory.
         build: The build being run.
         cwd: Directory to run the command in.
         logfile: Open log file that receives the output of the command.
@@ -213,6 +235,8 @@ def run_command(
         database,
         build,
         logfile,
+        run_as=settings.build_user,
+        home=store.home_dir(build["id"]),
     )
     _stop_unless_succeeded(result, "build command")
 
@@ -327,15 +351,22 @@ def run_build(
     """
     build_id = build["id"]
     work_dir = store.work_dir(build_id)
+    home_dir = store.home_dir(build_id)
     log_path = store.log_path(build_id)
     status, exit_code, error = db.FAILED, None, None
     try:
         root = None
+        if settings.build_user:
+            # Whatever an earlier build left goes, so it cannot reach this
+            # one, even if the worker died before cleaning up after it.
+            sandbox.clean_up(settings.build_user, store.work_root)
+            _empty_dir(store.work_root)
+            sandbox.prepare_home(home_dir)
         with open(log_path, "wb") as logfile:
             # One failing build must not take the worker down.
             try:
                 root = prepare_source(settings, database, store, build, logfile)
-                run_command(settings, database, build, root, logfile)
+                run_command(settings, database, store, build, root, logfile)
                 status, exit_code = db.SUCCEEDED, 0
             except BuildStoppedError as e:
                 status, exit_code, error = e.status, e.exit_code, e.reason
@@ -370,6 +401,9 @@ def run_build(
         _logger.exception("build %s failed", build_id)
         status, error = db.FAILED, f"{type(e).__name__}: {e}"
     finally:
+        if settings.build_user:
+            sandbox.clean_up(settings.build_user, store.work_root)
+            shutil.rmtree(home_dir, ignore_errors=True)
         if not settings.keep_workdir:
             shutil.rmtree(work_dir, ignore_errors=True)
     database.finish(build_id, status, exit_code, error)
@@ -380,6 +414,15 @@ def run_build(
         status,
         f": {error}" if error else "",
     )
+
+
+def _empty_dir(path: pathlib.Path) -> None:
+    """Deletes everything inside a directory, keeping the directory."""
+    for entry in path.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
 
 
 def run_once(
@@ -494,14 +537,25 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     settings = config.load_settings()
-    store = storage.Storage(settings.data_dir)
+    if settings.build_user:
+        # Work files stay writable for the group the build account is in.
+        os.umask(0o002)
+    else:
+        _logger.warning(
+            "BUILDSERVER_BUILD_USER is not set: builds run as the worker's"
+            " own account and can read the database and its secrets"
+        )
+    store = storage.Storage(settings.data_dir, settings.work_dir)
     database = db.Database(store.db_path, crypto.cipher_for(settings.token_key))
     interrupted = database.fail_interrupted()
     if interrupted:
         _logger.warning("marked %d interrupted build(s) as failed", interrupted)
     _logger.info(
-        "worker ready, data dir %s, command %s, %s",
+        "worker ready, data dir %s, work dir %s, build account %s,"
+        " command %s, %s",
         settings.data_dir,
+        store.work_root,
+        settings.build_user or "(the worker's)",
         settings.build_command,
         f"build files kept {settings.retention_days:g} days"
         if settings.retention_days > 0

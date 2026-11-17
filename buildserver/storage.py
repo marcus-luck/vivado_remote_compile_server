@@ -6,8 +6,12 @@ Layout:
     <data_dir>/builds/<id>/package.zip    uploaded build package
     <data_dir>/builds/<id>/build.log      build output
     <data_dir>/builds/<id>/artifacts.zip  build artifacts
-    <data_dir>/work/<id>/                 extracted package, removed after the
-                                          build
+    <work_root>/<id>/                     extracted package or clone, removed
+                                          after the build
+    <work_root>/<id>.home/                home of a sandboxed build, removed
+                                          after the build
+
+<work_root> is <data_dir>/work unless BUILDSERVER_WORK_DIR moves it.
 
 The retention pass of the worker deletes the package and artifacts of old
 builds; their logs stay. It also deletes build directories whose build
@@ -29,15 +33,20 @@ class Storage:
         work_root: Directory holding the work directory of the running build.
     """
 
-    def __init__(self, data_dir: pathlib.Path) -> None:
+    def __init__(
+        self, data_dir: pathlib.Path, work_root: pathlib.Path | None = None
+    ) -> None:
         """Creates the directory layout if it is missing.
 
         Args:
             data_dir: Root of the data directory.
+            work_root: Directory for the work directories, or None for
+                data_dir/work. Kept apart from data_dir when builds run as
+                another account, which must not see data_dir.
         """
         self.data_dir = data_dir
         self.builds_dir = data_dir / "builds"
-        self.work_root = data_dir / "work"
+        self.work_root = work_root or data_dir / "work"
         self.builds_dir.mkdir(parents=True, exist_ok=True)
         self.work_root.mkdir(parents=True, exist_ok=True)
 
@@ -65,6 +74,14 @@ class Storage:
     def work_dir(self, build_id: str) -> pathlib.Path:
         """Returns the directory a build's package is extracted to."""
         return self.work_root / build_id
+
+    def home_dir(self, build_id: str) -> pathlib.Path:
+        """Returns the fresh home directory a sandboxed build runs with.
+
+        It lies next to the work directory, not inside it, so it does not
+        disturb the search for the build script.
+        """
+        return self.work_root / f"{build_id}.home"
 
     def expire_files(self, build_id: str) -> None:
         """Deletes the package and artifacts of a build, keeping its log.
