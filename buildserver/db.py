@@ -463,6 +463,44 @@ class Database:
             )
         return cursor.rowcount
 
+    def ping(self) -> None:
+        """Checks that the database can be read.
+
+        Raises:
+            sqlite3.Error: If it cannot.
+        """
+        with self._connect() as conn:
+            conn.execute("SELECT 1 FROM builds LIMIT 1").fetchall()
+
+    def count_by_status(self) -> dict[str, int]:
+        """Counts the builds in each status.
+
+        Returns:
+            The number of builds per status; statuses without builds are
+            missing.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM builds GROUP BY status"
+            ).fetchall()
+        return {row["status"]: row["n"] for row in rows}
+
+    def backup_to(self, dest: pathlib.Path) -> None:
+        """Writes a consistent copy of the database, safe while it is in use.
+
+        The copy is a single file: it does not use a write-ahead log.
+
+        Args:
+            dest: The file to write; it is overwritten if it exists.
+        """
+        target = sqlite3.connect(dest)
+        try:
+            with self._connect() as conn:
+                conn.backup(target)
+            target.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            target.close()
+
     def create_user(
         self, email: str, role: str, is_service: bool = False
     ) -> User:

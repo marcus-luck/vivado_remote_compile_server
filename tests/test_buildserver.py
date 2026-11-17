@@ -323,6 +323,19 @@ def ui_upload(client, package: bytes, name: str = "ui_fw"):
     )
 
 
+def test_health_check_needs_no_sign_in(tmp_path, auth_settings):
+    settings = config.Settings(
+        data_dir=tmp_path,
+        build_command=["true"],
+        build_script="build.py",
+        artifact_dir="out",
+    )
+    client = testclient.TestClient(api.create_app(settings, auth_settings))
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
 def test_front_end_is_served(env):
     client = env[3]
     page = client.get("/").text

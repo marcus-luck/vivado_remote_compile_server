@@ -7,13 +7,14 @@ Run with:
 /api/... is the JSON API. / and /ui/... serve the front end: / is the full
 page, and the /ui/... routes return the HTML fragments htmx swaps into it.
 Sign-in, API tokens and user management live in buildserver.auth; every route
-here except / requires a signed-in user or an API token.
+here except / and /healthz requires a signed-in user or an API token.
 """
 
 import datetime
 import logging
 import pathlib
 import shutil
+import sqlite3
 import uuid
 import zipfile
 
@@ -111,6 +112,21 @@ def create_app(
         same_site="lax",
         https_only=auth_settings.public_url.startswith("https://"),
     )
+
+    @app.get("/healthz")
+    def healthz() -> responses.JSONResponse:
+        """Reports whether the server can read its database.
+
+        Needs no sign-in and shows no data: Docker and the deploy script
+        call it.
+        """
+        try:
+            database.ping()
+        except sqlite3.Error:
+            _logger.exception("health check failed")
+            return responses.JSONResponse({"status": "error"}, status_code=503)
+        return responses.JSONResponse({"status": "ok"})
+
     app.include_router(
         auth.create_router(database, auth_settings, app.state.oauth)
     )

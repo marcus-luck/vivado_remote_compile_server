@@ -24,7 +24,8 @@ services:
     security_opt:
       - no-new-privileges:true
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   api:
     build:
@@ -38,6 +39,18 @@ services:
       - data:/data
     security_opt:
       - no-new-privileges:true
+    # deploy/buildserverctl waits for this before it calls a deploy good.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      start_interval: 2s
+      retries: 3
     # No published port: only Caddy reaches it, on the compose network.
 
   worker:
