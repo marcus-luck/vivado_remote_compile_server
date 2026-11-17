@@ -117,22 +117,27 @@ def create_app(
         build["has_artifacts"] = store.artifacts_path(build["id"]).is_file()
         return build
 
-    def can_delete(build: db.Build, user: db.User) -> bool:
-        """Tells whether a user may delete a build: its creator or an admin."""
+    def can_access(build: db.Build, user: db.User) -> bool:
+        """Tells whether a user may see a build: its creator or an admin.
+
+        The same users may read its log, download, cancel and delete it.
+        """
         return auth.is_admin(user) or build["created_by"] == user["email"]
 
-    def present_all(user: db.User) -> list[db.Build]:
-        """Returns the recent builds as they are shown in the build table.
+    def present_all(user: db.User, limit: int = 200) -> list[db.Build]:
+        """Returns the recent builds a user may see, as clients are shown them.
 
         Args:
-            user: The user viewing the table.
+            user: The user viewing the builds.
+            limit: Maximum number of builds to return.
 
         Returns:
-            The builds, each with can_delete set for that user.
+            The builds, newest first: all of them for an admin, otherwise
+            the ones the user queued.
         """
+        created_by = None if auth.is_admin(user) else user["email"]
         return [
-            {**present(build), "can_delete": can_delete(build, user)}
-            for build in database.list_builds()
+            present(build) for build in database.list_builds(limit, created_by)
         ]
 
     def builds_fragment(
@@ -143,10 +148,22 @@ def create_app(
             request, "_builds.html", {"builds": present_all(user)}
         )
 
-    def get_or_404(build_id: str) -> db.Build:
-        """Returns a build record, or raises a 404 if there is none."""
+    def get_or_404(build_id: str, user: db.User) -> db.Build:
+        """Returns a build record the user may see.
+
+        Args:
+            build_id: Id of the build.
+            user: The user asking for it.
+
+        Returns:
+            The build record.
+
+        Raises:
+            fastapi.HTTPException: A 404 if there is no such build or the
+                user may not see it; the two are not told apart.
+        """
         build = database.get(build_id)
-        if build is None:
+        if build is None or not can_access(build, user):
             raise fastapi.HTTPException(404, "build not found")
         return build
 
@@ -158,15 +175,10 @@ def create_app(
             user: The user deleting the build.
 
         Raises:
-            fastapi.HTTPException: If there is no such build (404), the user
-                is neither its creator nor an admin (403), or it is running
-                (409).
+            fastapi.HTTPException: If the user may not see the build or there
+                is none (404), or it is running (409).
         """
-        build = get_or_404(build_id)
-        if not can_delete(build, user):
-            raise fastapi.HTTPException(
-                403, "only the build's creator or an admin can delete it"
-            )
+        get_or_404(build_id, user)
         if not database.delete_build(build_id):
             raise fastapi.HTTPException(409, "cancel the running build first")
         try:
@@ -257,21 +269,28 @@ def create_app(
         return present(store_upload(package, name, user))
 
     @protected.get("/api/builds")
-    def list_builds(limit: int = 200) -> list[db.Build]:
-        """Lists the most recent builds, newest first."""
-        return [present(build) for build in database.list_builds(limit)]
+    def list_builds(
+        limit: int = 200,
+        user: db.User = fastapi.Depends(auth.current_user),
+    ) -> list[db.Build]:
+        """Lists your most recent builds (everybody's for an admin)."""
+        return present_all(user, limit)
 
     @protected.get("/api/builds/{build_id}")
-    def get_build(build_id: str) -> db.Build:
+    def get_build(
+        build_id: str, user: db.User = fastapi.Depends(auth.current_user)
+    ) -> db.Build:
         """Returns one build."""
-        return present(get_or_404(build_id))
+        return present(get_or_404(build_id, user))
 
     @protected.post("/api/builds/{build_id}/cancel")
-    def cancel_build(build_id: str) -> db.Build:
+    def cancel_build(
+        build_id: str, user: db.User = fastapi.Depends(auth.current_user)
+    ) -> db.Build:
         """Cancels a queued or running build."""
-        get_or_404(build_id)
+        get_or_404(build_id, user)
         database.request_cancel(build_id)
-        return present(get_or_404(build_id))
+        return present(get_or_404(build_id, user))
 
     @protected.delete("/api/builds/{build_id}", status_code=204)
     def delete_build(
@@ -283,15 +302,21 @@ def create_app(
     @protected.get(
         "/api/builds/{build_id}/log", response_class=responses.PlainTextResponse
     )
-    def get_log(build_id: str, tail: int = _LOG_TAIL_BYTES) -> str:
+    def get_log(
+        build_id: str,
+        tail: int = _LOG_TAIL_BYTES,
+        user: db.User = fastapi.Depends(auth.current_user),
+    ) -> str:
         """Returns the last `tail` bytes of the build log (0 for all of it)."""
-        get_or_404(build_id)
+        get_or_404(build_id, user)
         return read_log(build_id, tail)
 
     @protected.get("/api/builds/{build_id}/artifacts")
-    def download_artifacts(build_id: str) -> responses.FileResponse:
+    def download_artifacts(
+        build_id: str, user: db.User = fastapi.Depends(auth.current_user)
+    ) -> responses.FileResponse:
         """Downloads the artifacts of a build as a zip archive."""
-        build = get_or_404(build_id)
+        build = get_or_404(build_id, user)
         path = store.artifacts_path(build_id)
         if not path.is_file():
             raise fastapi.HTTPException(404, "no artifacts for this build")
@@ -362,6 +387,10 @@ def create_app(
         user: db.User = fastapi.Depends(auth.current_user),
     ) -> responses.Response:
         """Cancels a build and serves the build table fragment."""
+        try:
+            get_or_404(build_id, user)
+        except fastapi.HTTPException:
+            return builds_fragment(request, user)
         database.request_cancel(build_id)
         return builds_fragment(request, user)
 
@@ -387,9 +416,13 @@ def create_app(
     @protected.get(
         "/ui/builds/{build_id}/log", response_class=responses.HTMLResponse
     )
-    def ui_log(request: fastapi.Request, build_id: str) -> responses.Response:
+    def ui_log(
+        request: fastapi.Request,
+        build_id: str,
+        user: db.User = fastapi.Depends(auth.current_user),
+    ) -> responses.Response:
         """Serves the log panel fragment of a build."""
-        build = get_or_404(build_id)
+        build = get_or_404(build_id, user)
         return templates.TemplateResponse(
             request,
             "_log.html",
@@ -399,12 +432,14 @@ def create_app(
     @protected.get(
         "/ui/builds/{build_id}/log/text", response_class=responses.HTMLResponse
     )
-    def ui_log_text(build_id: str) -> responses.Response:
+    def ui_log_text(
+        build_id: str, user: db.User = fastapi.Depends(auth.current_user)
+    ) -> responses.Response:
         """Serves the log text polled by an open log panel.
 
         Once the build is over the response tells htmx to stop polling.
         """
-        build = get_or_404(build_id)
+        build = get_or_404(build_id, user)
         active = build["status"] in (db.QUEUED, db.RUNNING)
         text = read_log(build_id, _LOG_TAIL_BYTES) or "(empty)"
         return responses.HTMLResponse(

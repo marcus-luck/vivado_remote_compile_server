@@ -373,11 +373,51 @@ def test_only_creator_or_admin_deletes(env, sign_in):
     build = upload(other_client(admin, sign_in), make_package(GOOD_BUILD))
     build_id = build.json()["id"]
     stranger = other_client(admin, sign_in, "eve@team.example.com")
-    assert stranger.delete(f"/api/builds/{build_id}").status_code == 403
+    assert stranger.delete(f"/api/builds/{build_id}").status_code == 404
     assert "Delete</button>" not in stranger.get("/ui/builds").text
 
     assert "Delete</button>" in admin.get("/ui/builds").text
     assert admin.delete(f"/api/builds/{build_id}").status_code == 204
+
+
+def test_builds_are_visible_only_to_creator_and_admin(env, sign_in):
+    settings, database, store, admin = env
+    mine = other_client(admin, sign_in)
+    build = upload(mine, make_package(GOOD_BUILD), name="secret_fw").json()
+    worker.run_once(settings, database, store)
+    stranger = other_client(admin, sign_in, "eve@team.example.com")
+    upload(stranger, make_package(GOOD_BUILD), name="eves_fw")
+
+    base = f"/api/builds/{build['id']}"
+    for path in (base, f"{base}/log", f"{base}/artifacts"):
+        assert stranger.get(path).status_code == 404, path
+        assert mine.get(path).status_code == 200, path
+        assert admin.get(path).status_code == 200, path
+    for path in (
+        f"/ui/builds/{build['id']}/log",
+        f"/ui/builds/{build['id']}/log/text",
+    ):
+        assert stranger.get(path).status_code == 404, path
+    assert stranger.post(f"{base}/cancel").status_code == 404
+
+    assert [b["name"] for b in stranger.get("/api/builds").json()] == [
+        "eves_fw"
+    ]
+    assert [b["name"] for b in mine.get("/api/builds").json()] == ["secret_fw"]
+    assert {b["name"] for b in admin.get("/api/builds").json()} == {
+        "secret_fw",
+        "eves_fw",
+    }
+    assert "secret_fw" not in stranger.get("/ui/builds").text
+    assert "secret_fw" in admin.get("/ui/builds").text
+
+
+def test_strangers_cannot_cancel_from_the_table(env, sign_in):
+    _, database, _, admin = env
+    build = upload(other_client(admin, sign_in), make_package(GOOD_BUILD))
+    stranger = other_client(admin, sign_in, "eve@team.example.com")
+    stranger.post(f"/ui/builds/{build.json()['id']}/cancel")
+    assert database.get(build.json()["id"])["status"] == "queued"
 
 
 def test_deleted_queued_build_is_not_run(env):

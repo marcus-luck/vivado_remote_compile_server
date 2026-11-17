@@ -112,11 +112,19 @@ which matches the `build.tcl` convention of the firmware projects: output goes t
 artifact zip. It is collected for failed builds as well, so timing and DRC reports
 of a build that died in routing are still downloadable.
 
+## Who sees a build
+
+A build is visible only to the user who queued it and to administrators. Only
+they see it in the build table and `GET /api/builds`, and only they can read
+its log, download its artifacts, cancel or delete it. For anyone else its URLs
+answer 404, as if it did not exist. This holds for uploaded packages and for
+builds from a repository: a build an admin queues from your repository is the
+admin's.
+
 ## Deleting builds and retention
 
 *Delete* in the build table (or `DELETE /api/builds/{id}`) removes a build and
-all its files. Only the user who queued it, or an admin, can delete a build; a
-running build has to be cancelled first. If a file cannot be deleted (a
+all its files. A running build has to be cancelled first. If a file cannot be deleted (a
 download holds it open on Windows, say), the worker's hourly pass removes the
 leftover directory later.
 
@@ -210,14 +218,16 @@ POST /api/users/{id}/tokens    {"name": "gitlab runner", "expires_in_days": 365}
 | Method | Path | |
 | --- | --- | --- |
 | `POST` | `/api/builds` | Upload a package. Multipart form: `package` (zip), optional `name` |
-| `GET` | `/api/builds` | List builds, newest first |
+| `GET` | `/api/builds` | List your builds (everybody's for an admin), newest first |
 | `GET` | `/api/builds/{id}` | One build |
 | `GET` | `/api/builds/{id}/log?tail=65536` | Build log as text (`tail=0` for all of it) |
 | `GET` | `/api/builds/{id}/artifacts` | Artifact zip |
 | `POST` | `/api/builds/{id}/cancel` | Cancel a queued or running build |
-| `DELETE` | `/api/builds/{id}` | Delete a build and its files: its creator or an admin; 409 while running |
+| `DELETE` | `/api/builds/{id}` | Delete a build and its files; 409 while running |
 
-Status is one of `queued`, `running`, `succeeded`, `failed`, `cancelled`. Each
+Every `/api/builds/{id}...` route answers 404 unless you queued the build or
+are an admin. Status is one of `queued`, `running`, `succeeded`, `failed`,
+`cancelled`. Each
 build records the email (or service account name) of the user who queued it in
 `created_by`. A build from a repository has an empty `package_filename` and
 sets `repo_full_name`, `ref`, `ref_type` (`branch` or `tag`) and, once cloned,

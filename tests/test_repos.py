@@ -367,6 +367,15 @@ def test_repositories_are_per_user_but_admins_see_all(env, dev, admin, sign_in):
     assert DEV in admin.get("/ui/repos").text
 
 
+def test_repository_builds_are_visible_only_to_who_queued_them(dev, admin):
+    repo_id = add_repo(dev).json()["id"]
+    by_admin = admin.post(f"/api/repos/{repo_id}/builds").json()
+    by_dev = dev.post(f"/api/repos/{repo_id}/builds").json()
+    assert [b["id"] for b in dev.get("/api/builds").json()] == [by_dev["id"]]
+    assert dev.get(f"/api/builds/{by_admin['id']}").status_code == 404
+    assert admin.get(f"/api/builds/{by_dev['id']}").status_code == 200
+
+
 def test_update_fetches_refs_and_falls_back_to_default(env, dev):
     state = env[4]
     repo_id = add_repo(dev).json()["id"]

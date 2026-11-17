@@ -264,20 +264,27 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
-    def list_builds(self, limit: int = 200) -> list[Build]:
+    def list_builds(
+        self, limit: int = 200, created_by: str | None = None
+    ) -> list[Build]:
         """Lists the most recent builds.
 
         Args:
             limit: Maximum number of builds to return.
+            created_by: Only list the builds this user queued (their email or
+                service account name). None lists everybody's.
 
         Returns:
             The build records, newest first.
         """
+        where, params = "", ()
+        if created_by is not None:
+            where, params = " WHERE created_by = ?", (created_by,)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM builds"
+                f"SELECT * FROM builds{where}"
                 " ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                (limit,),
+                (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 

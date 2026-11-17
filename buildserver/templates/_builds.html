@@ -43,7 +43,7 @@
         <button type="button" hx-post="ui/builds/{{ b.id }}/cancel" hx-target="#builds"
                 hx-confirm="Cancel build {{ b.name }}?">Cancel</button>
         {% endif %}
-        {% if b.can_delete and b.status != 'running' %}
+        {% if b.status != 'running' %}
         <button type="button" hx-post="ui/builds/{{ b.id }}/delete" hx-target="#builds"
                 hx-confirm="Delete build {{ b.name }} and its files?">Delete</button>
         {% endif %}
