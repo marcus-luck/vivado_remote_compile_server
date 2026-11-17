@@ -1,0 +1,6 @@
+# Files that go into Linux images keep LF line endings on every checkout.
+Dockerfile text eol=lf
+deploy/caddy/Dockerfile text eol=lf
+deploy/sudoers text eol=lf
+deploy/Caddyfile text eol=lf
+compose.yaml text eol=lf
