@@ -5,7 +5,7 @@ with Vivado (`build.tcl`), and the artifacts are downloadable as a zip.
 
 ## Architecture
 
-Two processes sharing one `.env` and one data directory (`BUILDSERVER_DATA_DIR`, default `./data`):
+Two processes (the `api` and `worker` containers) sharing one `.env` and one data directory (`BUILDSERVER_DATA_DIR`, `/data` in Docker):
 
 - `buildserver/api.py`: FastAPI app. `/api/builds` is the JSON API (upload, list, log, artifacts, cancel, delete); a build is visible only to its creator (`created_by`) and admins, others get 404 (`can_access`, `get_or_404`); `/` and `/ui/...` serve the front end.
 - `buildserver/worker.py`: single worker, one build at a time. Extracts the package (or clones the repository's branch or tag with submodules, using the repository owner's GitHub token), runs the build command, zips `bitfiles/generated/<name>/` plus the log. Hourly, between builds, deletes the package and artifacts of builds finished more than `BUILDSERVER_RETENTION_DAYS` ago (row and log stay, `files_expired_at` set). The same pass deletes build directories whose row is gone (a delete that could not remove every file). Failures stop a build by raising `BuildStoppedError`.
@@ -38,14 +38,20 @@ before finishing a change.
 
 ## Commands
 
-Served as `https://buildserver.drystone.solutions` (local DNS only): Caddy
-(`deploy/Caddyfile`, Cloudflare DNS challenge, token in git-ignored
-`deploy/caddy.env`) proxies to uvicorn on 127.0.0.1:8000. Google sign-in needs
-HTTPS, so don't expose uvicorn directly.
+Deployed on a Linux host with Docker (`compose.yaml`, `Dockerfile`): `caddy`
+(`deploy/caddy/Dockerfile`, Cloudflare DNS challenge, token in git-ignored
+`deploy/caddy.env`) serves `https://buildserver.drystone.solutions` (local DNS
+only) and proxies to `api:8000`; `worker` mounts the host's Linux Vivado at
+`/opt/Xilinx` read-only and runs builds as `builder` (`deploy/sudoers`). Both
+share the `data` volume (0700, user `app`). Google sign-in needs HTTPS, so
+don't publish the api port.
 
 ```
+docker compose up -d --build
+docker compose logs -f worker
+docker build --target worker-test -t buildserver-test .
+docker run --rm --init -e BUILDSERVER_TEST_SANDBOX=1 buildserver-test
 uv run uvicorn --factory buildserver.api:create_app --host 127.0.0.1 --port 8000
-caddy run --config deploy/Caddyfile --envfile deploy/caddy.env
 uv run python -m buildserver.worker
 uv run pytest
 uv run ruff format .

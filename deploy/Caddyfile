@@ -1,13 +1,12 @@
 # HTTPS front for the build server on the local network.
 #
-# Caddy terminates TLS and forwards to uvicorn on 127.0.0.1:8000. The host name
+# Caddy terminates TLS and forwards to the api container on port 8000. The host name
 # resolves to a private address, so Let's Encrypt cannot reach it; the
 # certificate is obtained with a DNS challenge through Cloudflare instead.
 #
-# Needs a Caddy build with the Cloudflare DNS module, and CLOUDFLARE_API_TOKEN
-# from caddy.env (see caddy.env.template). Run from the repository root:
-#
-#   caddy run --config deploy/Caddyfile --envfile deploy/caddy.env
+# Runs in the caddy container of compose.yaml, a Caddy build with the
+# Cloudflare DNS module (deploy/caddy/Dockerfile), with CLOUDFLARE_API_TOKEN
+# from caddy.env (see caddy.env.template).
 
 buildserver.drystone.solutions {
 	tls {
@@ -16,5 +15,5 @@ buildserver.drystone.solutions {
 		# answers for this name itself and may not see the TXT record.
 		resolvers 1.1.1.1
 	}
-	reverse_proxy 127.0.0.1:8000
+	reverse_proxy api:8000
 }

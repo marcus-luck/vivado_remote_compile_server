@@ -1,12 +1,12 @@
-r"""Tests of running builds as a separate account (buildserver.sandbox).
+"""Tests of running builds as a separate account (buildserver.sandbox).
 
 The unit tests run anywhere: they check the command lines and, with sudo
 faked away, how the worker uses them. The tests marked `sandbox` need the
 Linux worker image, with its build account and work root, and run only with
 BUILDSERVER_TEST_SANDBOX=1:
 
-    docker compose run --rm -e BUILDSERVER_TEST_SANDBOX=1 worker \\
-        python -m pytest -m sandbox
+    docker build --target worker-test -t buildserver-test .
+    docker run --rm --init -e BUILDSERVER_TEST_SANDBOX=1 buildserver-test
 """
 
 import dataclasses
@@ -267,10 +267,18 @@ def sandboxed(tmp_path, auth_settings, sign_in):
 
 
 def builder_processes() -> str:
+    """Lists the live processes of the build account; zombies don't count."""
     result = subprocess.run(
-        ["pgrep", "-u", BUILD_USER, "-a"], capture_output=True, text=True
+        ["ps", "-u", BUILD_USER, "-o", "stat=,pid=,args="],
+        capture_output=True,
+        text=True,
     )
-    return result.stdout.strip()
+    live = [
+        line
+        for line in result.stdout.strip().splitlines()
+        if not line.lstrip().startswith("Z")
+    ]
+    return "; ".join(live)
 
 
 @pytest.mark.sandbox

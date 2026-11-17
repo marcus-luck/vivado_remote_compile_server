@@ -11,24 +11,81 @@ a worker builds it, and the build artifacts are offered back as a zip.
 - **Users**: Google sign-in over OAuth, a `users` table, and a user management API (`buildserver/auth.py`)
 - **Repositories**: users link a GitHub account and build branches or tags of its repositories (`buildserver/repos.py`, `github.py`, `git.py`)
 
-## Running
+## Deployment (Docker)
 
-Two processes, started from this directory:
+The server runs on a Linux host as three containers (`compose.yaml`):
+
+- `caddy`: HTTPS on ports 80 and 443 (see "HTTPS on the local network").
+- `api`: the API and front end, reachable only from Caddy.
+- `worker`: runs the builds, one at a time.
+
+The database, packages, logs and artifacts live in the `data` volume. Vivado
+is not in any image: the host's Linux install is mounted read-only into the
+worker at `/opt/Xilinx`.
+
+Setup, once:
+
+1. Install Docker with the compose plugin, and the Linux Vivado at
+   `/opt/Xilinx` (or set `VIVADO_DIR=/path/to/Xilinx` in `.env`).
+2. Copy `.env.template` to `.env` and fill it in. `BUILDSERVER_VIVADO` is the
+   path inside the container, e.g. `/opt/Xilinx/Vivado/2024.2/bin/vivado`.
+   The compose file sets the data, work and build-account variables itself.
+3. Copy `deploy/caddy.env.template` to `deploy/caddy.env` and put the
+   Cloudflare token there.
+4. Start everything:
+
+   ```
+   docker compose up -d --build
+   docker compose logs -f worker
+   ```
+
+To upgrade, pull and run `docker compose up -d --build` again; a restarting
+worker marks the build it was running as failed. Back up the `data` volume,
+e.g. `docker run --rm -v buildserver_data:/data -v "$PWD":/backup ubuntu tar
+czf /backup/data.tgz -C /data .`, together with `.env`: without
+`BUILDSERVER_TOKEN_KEY` the stored GitHub tokens cannot be read. Run a single
+worker: builds are serialised on purpose (Vivado is CPU and memory bound).
+
+### Build isolation
+
+A build runs code from an uploaded package or a repository, so the worker
+does not run it as itself. In the worker container the worker runs as `app`
+and starts each build command through `sudo` as `builder`
+(`buildserver/sandbox.py`, `deploy/sudoers`):
+
+- `builder` cannot enter `/data`: no database, no GitHub tokens, no other
+  build's package, log or artifacts.
+- It gets the environment without the `BUILDSERVER_*` variables, and it
+  cannot read the worker's environment through `/proc`.
+- Every build gets a fresh home and temporary directory under `/work`. After
+  the build all `builder` processes are killed and its files are deleted, so
+  nothing (a `~/.Xilinx/Vivado/Vivado_init.tcl`, say) carries over to the next
+  build.
+
+A build can still use the network and the CPU, and it sees Vivado and its own
+sources. Only give accounts to people you trust to run code on the build
+host.
+
+The tests of the isolation need the worker image:
+
+```
+docker build --target worker-test -t buildserver-test .
+docker run --rm --init -e BUILDSERVER_TEST_SANDBOX=1 buildserver-test
+```
+
+### Local development
+
+On any machine, without Docker and without the isolation:
 
 ```
 uv sync
-uv run uvicorn --factory buildserver.api:create_app --host 0.0.0.0 --port 8000
+uv run uvicorn --factory buildserver.api:create_app --host 127.0.0.1 --port 8000
 uv run python -m buildserver.worker
+uv run pytest
 ```
 
-The front end is at `http://<host>:8000/`, interactive API docs at `/docs`.
-
-Run a single worker: builds are serialised on purpose (Vivado is CPU, memory and
-licence bound), and a starting worker marks any build still `running` as failed.
-
-Everything except the sign-in page requires a signed-in user. A build package
-still runs arbitrary code on the build host, so only give accounts to people you
-would trust with a shell on it.
+The front end is at `http://localhost:8000/`, interactive API docs at `/docs`.
+Everything except the sign-in page requires a signed-in user.
 
 ## Users and sign-in
 
@@ -48,33 +105,20 @@ sign in, serve the server under a host name over HTTPS and set
 
 ### HTTPS on the local network
 
-`deploy/Caddyfile` puts Caddy in front of uvicorn as the HTTPS endpoint for
+The `caddy` container is the HTTPS endpoint for
 `buildserver.drystone.solutions`, a name the local DNS server resolves to the
-build host. The name is not reachable from the internet, so Caddy gets its
-Let's Encrypt certificate through a DNS challenge on Cloudflare, which hosts the
-`drystone.solutions` zone.
+build host (`deploy/Caddyfile`). The name is not reachable from the internet,
+so Caddy gets its Let's Encrypt certificate through a DNS challenge on
+Cloudflare, which hosts the `drystone.solutions` zone. Its image
+(`deploy/caddy/Dockerfile`) is Caddy built with the Cloudflare DNS module.
 
-1. Get Caddy with the Cloudflare DNS module (the plain release lacks it). The
-   download service at caddyserver.com builds it on demand but can stall; with
-   Go installed, build it instead:
-   `go run github.com/caddyserver/xcaddy/cmd/xcaddy@latest build --with github.com/caddy-dns/cloudflare`
-   On the current build host it is `%LOCALAPPDATA%\Programs\Caddy\caddy.exe`.
-2. Create a Cloudflare API token from the *Edit zone DNS* template for the
-   `drystone.solutions` zone. Copy `deploy/caddy.env.template` to
-   `deploy/caddy.env` and put the token there. Keep it out of `.env`: variables
-   in `.env` are passed on to build commands.
-3. Add `https://buildserver.drystone.solutions/auth/callback` to the OAuth
+1. Create a Cloudflare API token from the *Edit zone DNS* template for the
+   `drystone.solutions` zone, and put it in `deploy/caddy.env`. It stays out
+   of `.env`, which the api and worker containers get.
+2. Add `https://buildserver.drystone.solutions/auth/callback` to the OAuth
    client's authorised redirect URIs in Google Cloud.
-4. In `.env`, set `BUILDSERVER_PUBLIC_URL=https://buildserver.drystone.solutions`.
-5. Allow inbound TCP 443 in Windows Firewall (admin PowerShell):
-   `New-NetFirewallRule -DisplayName "Build server HTTPS" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -Profile Private`
-6. Run uvicorn on loopback only, so all traffic goes through Caddy, and start
-   Caddy from the repository root:
-
-   ```
-   uv run uvicorn --factory buildserver.api:create_app --host 127.0.0.1 --port 8000
-   caddy run --config deploy/Caddyfile --envfile deploy/caddy.env
-   ```
+3. In `.env`, set `BUILDSERVER_PUBLIC_URL=https://buildserver.drystone.solutions`.
+4. Allow inbound TCP 443 (and 80, for the redirect) in the host's firewall.
 
 Caddy renews the certificate by itself.
 
@@ -125,7 +169,7 @@ admin's.
 
 *Delete* in the build table (or `DELETE /api/builds/{id}`) removes a build and
 all its files. A running build has to be cancelled first. If a file cannot be deleted (a
-download holds it open on Windows, say), the worker's hourly pass removes the
+download holds it open, say), the worker's hourly pass removes the
 leftover directory later.
 
 With `BUILDSERVER_RETENTION_DAYS` set, the worker deletes the package and the
@@ -169,9 +213,8 @@ repository the user can reach. The token is stored in the database encrypted
 with `BUILDSERVER_TOKEN_KEY`, so a copy of the database alone does not give it
 away. The worker passes it to git through environment variables only, so it is
 not written to `.git/config`, the build log or the build command's
-environment. The build command gets none of the `BUILDSERVER_*` variables
-either. Builds still run uploaded code as the worker's own user, which can read
-the database and the key; see the trust note above. *Unlink*
+environment. Builds run as a separate account that can read neither the
+database nor the key (see "Build isolation"). *Unlink*
 deletes the token and revokes it at GitHub. Linking requires a signed-in
 session; an API token cannot link an account.
 
@@ -281,7 +324,7 @@ Read by both processes:
 
 | Variable | | |
 | --- | --- | --- |
-| `BUILDSERVER_DATA_DIR` | required | Database, packages, logs, artifacts, work directories |
+| `BUILDSERVER_DATA_DIR` | required | Database, packages, logs, artifacts, and the work directories unless `BUILDSERVER_WORK_DIR` is set (`/data` in Docker) |
 | `BUILDSERVER_VIVADO` | required unless `BUILDSERVER_BUILD_COMMAND` is set | Vivado executable |
 | `BUILDSERVER_BUILD_SCRIPT` | required | File that must be at the top level of the package |
 | `BUILDSERVER_ARTIFACT_DIR` | required | Directory zipped as the artifacts, relative to the package root. `{name}` is the build name |
@@ -291,6 +334,9 @@ Read by both processes:
 | `BUILDSERVER_KEEP_WORKDIR` | default off | Set to `1` to keep the extracted package after the build |
 | `BUILDSERVER_GIT` | default `git` | Git executable the worker clones repositories with |
 | `BUILDSERVER_RETENTION_DAYS` | default off | Days after a build finishes before the worker deletes its package and artifacts (the log stays) |
+| `BUILDSERVER_TOKEN_KEY` | required with GitHub | Key the GitHub tokens are encrypted with in the database (both processes) |
+| `BUILDSERVER_BUILD_USER` | Linux only, default off | Account the build command runs as through sudo (`builder` in Docker); see "Build isolation" |
+| `BUILDSERVER_WORK_DIR` | default `<data dir>/work` | Where the work directories are made; outside the data directory when builds run as another account (`/work` in Docker) |
 
 Read by the API server only:
 
@@ -305,7 +351,7 @@ Read by the API server only:
 | `BUILDSERVER_GITHUB_CLIENT_ID` | optional | Client ID of the GitHub OAuth App; enables repositories |
 | `BUILDSERVER_GITHUB_CLIENT_SECRET` | optional | Client secret of the GitHub OAuth App |
 
-On Windows keep the data directory path short: Vivado fails on paths over 260 characters.
+In local development on Windows, keep the data directory path short: Vivado fails on paths over 260 characters.
 
 ## Tests
 
@@ -315,6 +361,8 @@ uv run pytest
 
 The tests use a small Python script in place of Vivado, a fake of the GitHub
 API, and local git repositories in place of github.com (git must be on PATH).
+The build isolation tests run only in the worker image; see "Build
+isolation".
 
 ## Style
 

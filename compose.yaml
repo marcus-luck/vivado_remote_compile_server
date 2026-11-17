@@ -1,0 +1,73 @@
+# The build server: Caddy (HTTPS), the API server and the build worker.
+#
+#   docker compose up -d --build
+#
+# Needs .env (from .env.template) and deploy/caddy.env (from
+# deploy/caddy.env.template) next to this file, and the Linux Vivado install
+# on the host at /opt/Xilinx, or at VIVADO_DIR set in .env. See "Deployment"
+# in README.md.
+
+name: buildserver
+
+services:
+  caddy:
+    build: deploy/caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file: deploy/caddy.env
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      target: api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      BUILDSERVER_DATA_DIR: /data
+    volumes:
+      - data:/data
+    security_opt:
+      - no-new-privileges:true
+    # No published port: only Caddy reaches it, on the compose network.
+
+  worker:
+    build:
+      context: .
+      target: worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      BUILDSERVER_DATA_DIR: /data
+      BUILDSERVER_WORK_DIR: /work
+      BUILDSERVER_BUILD_USER: builder
+    volumes:
+      - data:/data
+      - work:/work
+      - ${VIVADO_DIR:-/opt/Xilinx}:/opt/Xilinx:ro
+    # A running build is failed when the worker restarts; give it time to
+    # be killed cleanly.
+    stop_grace_period: 30s
+    # An init process reaps the build processes the worker kills.
+    init: true
+    # sudo, which runs builds as builder, needs setuid: no
+    # no-new-privileges here. Uncomment to cap what a build can take:
+    # mem_limit: 48g
+    # cpus: 12
+
+# Named volumes, not bind mounts: SQLite's locking between the api and
+# worker containers is reliable on them.
+volumes:
+  data:
+  work:
+  caddy_data:
+  caddy_config:
