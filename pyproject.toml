@@ -5,6 +5,7 @@ description = "Firmware build server: upload a build package, queue it, build it
 requires-python = ">=3.11"
 dependencies = [
     "authlib>=1.8.0",
+    "cryptography>=45",
     "fastapi>=0.115",
     "httpx>=0.28.1",
     "itsdangerous>=2.2.0",

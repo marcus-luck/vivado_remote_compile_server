@@ -165,10 +165,13 @@ repositories by searching their own or pasting a URL (`https://github.com/owner/
 
 **What the token can do.** OAuth Apps have no read-only scope for private
 repositories, so the link asks for `repo`: read *and write* access to every
-repository the user can reach. The token is stored in the database. The worker
-passes it to git through environment variables only, so it is not written to
-`.git/config`, the build log or the build command's environment; but builds run
-uploaded code as the same Windows user that can read the database. *Unlink*
+repository the user can reach. The token is stored in the database encrypted
+with `BUILDSERVER_TOKEN_KEY`, so a copy of the database alone does not give it
+away. The worker passes it to git through environment variables only, so it is
+not written to `.git/config`, the build log or the build command's
+environment. The build command gets none of the `BUILDSERVER_*` variables
+either. Builds still run uploaded code as the worker's own user, which can read
+the database and the key; see the trust note above. *Unlink*
 deletes the token and revokes it at GitHub. Linking requires a signed-in
 session; an API token cannot link an account.
 

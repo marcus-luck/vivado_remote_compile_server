@@ -6,6 +6,7 @@ A small Python script stands in for build.tcl and Vivado.
 import dataclasses
 import datetime
 import io
+import json
 import os
 import sys
 import threading
@@ -33,6 +34,13 @@ print("building", name)
 """
 FAILING_BUILD = "import sys\nprint('synthesis failed')\nsys.exit(3)\n"
 SLOW_BUILD = "import time\ntime.sleep(120)\n"
+# Writes its environment where the artifacts are collected.
+ENV_BUILD = """
+import json, os, pathlib, sys
+out = pathlib.Path("bitfiles/generated") / sys.argv[1]
+out.mkdir(parents=True)
+(out / "env.json").write_text(json.dumps(dict(os.environ)))
+"""
 
 
 def make_package(script: str, prefix: str = "") -> bytes:
@@ -101,6 +109,24 @@ def test_build_succeeds_and_artifacts_download(env):
         }
         assert zf.read("fw_v1.bit") == b"bitstream"
     assert not store.work_dir(build["id"]).exists()
+
+
+def test_build_command_gets_no_server_secrets(env, monkeypatch):
+    settings, database, store, client = env
+    monkeypatch.setenv("BUILDSERVER_SESSION_SECRET", "session-s3cret")
+    monkeypatch.setenv("BUILDSERVER_TOKEN_KEY", "key-s3cret")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("XILINXD_LICENSE_FILE", "2100@licence-host")
+    build = upload(client, make_package(ENV_BUILD)).json()
+    worker.run_once(settings, database, store)
+
+    resp = client.get(f"/api/builds/{build['id']}/artifacts")
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        build_env = json.loads(zf.read("env.json"))
+    assert build_env["XILINXD_LICENSE_FILE"] == "2100@licence-host"
+    for key in build_env:
+        assert not key.upper().startswith(("BUILDSERVER_", "GIT_CONFIG_"))
+    assert "s3cret" not in json.dumps(build_env)
 
 
 def test_package_with_single_top_level_folder(env):

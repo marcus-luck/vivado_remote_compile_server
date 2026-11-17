@@ -18,6 +18,8 @@ import pathlib
 import sqlite3
 from typing import Any
 
+from buildserver import crypto
+
 # A row of the builds table, keyed by column name.
 Build = dict[str, Any]
 # A row of the users table, keyed by column name.
@@ -132,17 +134,30 @@ class Database:
     Every method opens its own connection, so one instance can be shared
     between threads, and the API and worker processes can each have their own.
 
+    GitHub tokens are stored encrypted with the token cipher; without one,
+    no GitHub account can be linked.
+
     Attributes:
         path: Location of the SQLite database file.
     """
 
-    def __init__(self, path: pathlib.Path) -> None:
+    def __init__(
+        self,
+        path: pathlib.Path,
+        token_cipher: crypto.TokenCipher | None = None,
+    ) -> None:
         """Opens the database, creating the schema if it is missing.
+
+        With a token cipher, GitHub tokens stored in plaintext by an earlier
+        version are encrypted.
 
         Args:
             path: Location of the SQLite database file.
+            token_cipher: Encrypts the GitHub tokens, or None if no
+                BUILDSERVER_TOKEN_KEY is configured.
         """
         self.path = path
+        self._cipher = token_cipher
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
@@ -165,6 +180,21 @@ class Database:
                     "ALTER TABLE users"
                     " ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0"
                 )
+            # GitHub tokens stored before they were encrypted.
+            if self._cipher is not None:
+                rows = conn.execute(
+                    "SELECT user_id, access_token FROM github_links"
+                ).fetchall()
+                for row in rows:
+                    if not crypto.is_encrypted(row["access_token"]):
+                        conn.execute(
+                            "UPDATE github_links SET access_token = ?"
+                            " WHERE user_id = ?",
+                            (
+                                self._cipher.encrypt(row["access_token"]),
+                                row["user_id"],
+                            ),
+                        )
 
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -709,7 +739,14 @@ class Database:
         Raises:
             sqlite3.IntegrityError: If the GitHub account is linked to another
                 user.
+            RuntimeError: If no token cipher is configured.
         """
+        if self._cipher is None:
+            raise RuntimeError(
+                "BUILDSERVER_TOKEN_KEY is not set; GitHub tokens are only"
+                " stored encrypted"
+            )
+        stored = self._cipher.encrypt(access_token)
         with self._connect() as conn:
             row = conn.execute(
                 "INSERT INTO github_links"
@@ -720,9 +757,9 @@ class Database:
                 " access_token = excluded.access_token,"
                 " scope = excluded.scope, linked_at = excluded.linked_at"
                 " RETURNING *",
-                (user_id, github_id, login, access_token, scope, now()),
+                (user_id, github_id, login, stored, scope, now()),
             ).fetchone()
-        return dict(row)
+        return {**dict(row), "access_token": access_token}
 
     def get_github_link(self, user_id: int) -> GitHubLink | None:
         """Looks up the GitHub account linked to a user.
@@ -731,13 +768,29 @@ class Database:
             user_id: Id of the user.
 
         Returns:
-            The link record, or None if the user has not linked an account.
+            The link record, with the token decrypted, or None if the user
+            has not linked an account.
+
+        Raises:
+            RuntimeError: If the token is encrypted and no token cipher is
+                configured.
+            ValueError: If the token cannot be decrypted with the key.
         """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM github_links WHERE user_id = ?", (user_id,)
             ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        link = dict(row)
+        if crypto.is_encrypted(link["access_token"]):
+            if self._cipher is None:
+                raise RuntimeError(
+                    "BUILDSERVER_TOKEN_KEY is not set; the stored GitHub"
+                    " tokens cannot be decrypted"
+                )
+            link["access_token"] = self._cipher.decrypt(link["access_token"])
+        return link
 
     def delete_github_link(self, user_id: int) -> bool:
         """Removes the GitHub link of a user.

@@ -9,6 +9,7 @@ import dataclasses
 import io
 import json
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import zipfile
@@ -19,6 +20,7 @@ import pytest
 
 from buildserver import api
 from buildserver import config
+from buildserver import crypto
 from buildserver import db
 from buildserver import git
 from buildserver import github
@@ -27,6 +29,7 @@ from buildserver import worker
 
 ADMIN = "admin@example.com"
 DEV = "dev@team.example.com"
+TOKEN_KEY = crypto.generate_key()
 OTHER = "other@team.example.com"
 TOKENS = {"gho_admin": (1, "boss"), "gho_dev": (2, "octo"), "gho_b": (3, "b")}
 
@@ -193,6 +196,7 @@ def env(tmp_path, auth_settings, remote):
         build_script="build.py",
         artifact_dir="bitfiles/generated/{name}",
         keep_workdir=True,
+        token_key=TOKEN_KEY,
     )
     auth_settings = dataclasses.replace(
         auth_settings, github_client_id="gh-id", github_client_secret="gh-sec"
@@ -201,7 +205,8 @@ def env(tmp_path, auth_settings, remote):
     state = FakeGitHub(["main", "dev"], ["v1.0"], [])
     app.state.github_http = fake_github_client(state)
     store = storage.Storage(settings.data_dir)
-    return settings, db.Database(store.db_path), store, app, state
+    database = db.Database(store.db_path, crypto.TokenCipher(TOKEN_KEY))
+    return settings, database, store, app, state
 
 
 def link_github(client: testclient.TestClient, token: str) -> httpx.Response:
@@ -275,6 +280,60 @@ def test_unlink_revokes_the_grant(env, dev):
     assert dev.post("/auth/github/unlink", follow_redirects=False).status_code
     assert state.revoked == ["gho_dev"]
     assert dev.get("/api/me").json()["github_login"] is None
+
+
+def raw_tokens(store) -> list[str]:
+    conn = sqlite3.connect(store.db_path)
+    try:
+        return [
+            r[0] for r in conn.execute("SELECT access_token FROM github_links")
+        ]
+    finally:
+        conn.close()
+
+
+def test_tokens_are_stored_encrypted(env, dev):
+    store = env[2]
+    (stored,) = raw_tokens(store)
+    assert "gho_dev" not in stored and stored.startswith(crypto.PREFIX)
+    user_id = dev.get("/api/me").json()["id"]
+    assert env[1].get_github_link(user_id)["access_token"] == "gho_dev"
+
+
+def test_plaintext_tokens_are_encrypted_on_open(env, dev):
+    store = env[2]
+    conn = sqlite3.connect(store.db_path)
+    with conn:
+        conn.execute("UPDATE github_links SET access_token = 'gho_old'")
+    conn.close()
+    database = db.Database(store.db_path, crypto.TokenCipher(TOKEN_KEY))
+    (stored,) = raw_tokens(store)
+    assert stored.startswith(crypto.PREFIX)
+    user_id = dev.get("/api/me").json()["id"]
+    assert database.get_github_link(user_id)["access_token"] == "gho_old"
+
+
+def test_tokens_need_the_right_key(env, dev):
+    store = env[2]
+    user_id = dev.get("/api/me").json()["id"]
+    other_key = db.Database(
+        store.db_path, crypto.TokenCipher(crypto.generate_key())
+    )
+    with pytest.raises(ValueError, match="cannot be decrypted"):
+        other_key.get_github_link(user_id)
+    with pytest.raises(RuntimeError, match="BUILDSERVER_TOKEN_KEY"):
+        db.Database(store.db_path).get_github_link(user_id)
+
+
+def test_github_needs_a_token_key(env, auth_settings):
+    settings = dataclasses.replace(env[0], token_key="")
+    auth_settings = dataclasses.replace(
+        auth_settings, github_client_id="gh-id", github_client_secret="gh-sec"
+    )
+    with pytest.raises(ValueError, match="BUILDSERVER_TOKEN_KEY"):
+        api.create_app(settings, auth_settings)
+    with pytest.raises(ValueError, match="not a valid key"):
+        crypto.TokenCipher("not-a-key")
 
 
 # Adding repositories ########################################################

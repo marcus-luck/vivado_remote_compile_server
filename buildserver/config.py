@@ -37,6 +37,8 @@ class Settings:
         retention_days: Days after a build finishes before its package and
             artifacts are deleted; 0 keeps them forever.
         retention_interval: Seconds between the worker's retention passes.
+        token_key: Key the GitHub tokens are encrypted with in the database
+            (see buildserver.crypto); empty if GitHub is not used.
     """
 
     data_dir: pathlib.Path
@@ -50,6 +52,7 @@ class Settings:
     git: str = "git"
     retention_days: float = 0
     retention_interval: float = 3600
+    token_key: str = dataclasses.field(default="", repr=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,8 +125,9 @@ def load_settings() -> Settings:
     """Builds the settings from the .env file and the environment.
 
     Every path comes from the configuration; none has a default in the code.
-    The .env file is loaded into os.environ, so the build command inherits
-    its variables too (a Vivado licence server, for example).
+    The .env file is loaded into os.environ. The build command gets the
+    variables that do not start with BUILDSERVER_ (a Vivado licence server,
+    for example); see worker.build_env().
 
     Returns:
         The settings.
@@ -174,6 +178,7 @@ def load_settings() -> Settings:
         retention_days=float(
             env.get("BUILDSERVER_RETENTION_DAYS") or defaults["retention_days"]
         ),
+        token_key=env.get("BUILDSERVER_TOKEN_KEY", ""),
     )
 
 

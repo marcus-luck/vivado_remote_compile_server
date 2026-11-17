@@ -27,6 +27,7 @@ from starlette.middleware import sessions
 
 from buildserver import auth
 from buildserver import config
+from buildserver import crypto
 from buildserver import db
 from buildserver import github
 from buildserver import names
@@ -86,11 +87,20 @@ def create_app(
 
     Returns:
         The application, serving the JSON API and the front end.
+
+    Raises:
+        ValueError: If GitHub is configured without BUILDSERVER_TOKEN_KEY, or
+            the key is not valid.
     """
     settings = settings or config.load_settings()
     auth_settings = auth_settings or config.load_auth_settings()
+    if auth_settings.github_enabled and not settings.token_key:
+        raise ValueError(
+            "BUILDSERVER_TOKEN_KEY must be set when GitHub is configured"
+            " (see .env.template)"
+        )
     store = storage.Storage(settings.data_dir)
-    database = db.Database(store.db_path)
+    database = db.Database(store.db_path, crypto.cipher_for(settings.token_key))
     app = fastapi.FastAPI(title="Firmware build server")
     app.state.database = database
     app.state.oauth = auth.create_oauth(auth_settings)

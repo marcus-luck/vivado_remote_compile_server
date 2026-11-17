@@ -14,6 +14,7 @@ Two processes sharing one `.env` and one data directory (`BUILDSERVER_DATA_DIR`,
 - `buildserver/github.py`: the GitHub REST calls (user, repos, branches, tags, revoke), over an `httpx.Client` kept on `app.state.github_http`.
 - `buildserver/git.py`: the clone command and its environment. The token goes to git only through `GIT_CONFIG_*` environment variables, never a URL, command line or log.
 - `buildserver/names.py`: valid build names and defaults.
+- `buildserver/crypto.py`: Fernet encryption of the GitHub tokens in `github_links` (`BUILDSERVER_TOKEN_KEY`; `db.Database` takes the cipher, encrypts on write, decrypts on read, migrates plaintext rows on open). The build command gets `worker.build_env()`: the environment without `BUILDSERVER_*` and `GIT_CONFIG_*`.
 - `buildserver/db.py`: SQLite `builds` table, which is also the task queue (oldest `queued` row is claimed), `users`, `api_tokens`, `github_links` and `repos` tables.
 - `buildserver/storage.py`: on-disk layout and zip handling.
 - `buildserver/config.py`: settings from `BUILDSERVER_*` variables in `.env` (see `.env.template`); the real environment overrides the file. No paths are hardcoded in the code: every path setting is required and comes from `.env`.

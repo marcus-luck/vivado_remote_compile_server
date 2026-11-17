@@ -16,6 +16,7 @@ import time
 from typing import BinaryIO
 
 from buildserver import config
+from buildserver import crypto
 from buildserver import db
 from buildserver import git
 from buildserver import storage
@@ -159,6 +160,25 @@ def _run_process(
     return db.SUCCEEDED, exit_code, None
 
 
+def build_env() -> dict[str, str]:
+    """Returns the environment of the build command.
+
+    The worker's environment without the server's own variables
+    (BUILDSERVER_*, which hold the session secret, the OAuth secrets and the
+    token key) and without git configuration passed through the environment
+    (GIT_CONFIG_*, which carries the clone token). Everything else in .env,
+    such as a Vivado licence server, reaches the build.
+
+    Returns:
+        The environment variables.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith(("BUILDSERVER_", "GIT_CONFIG_"))
+    }
+
+
 def run_command(
     settings: config.Settings,
     database: db.Database,
@@ -186,7 +206,13 @@ def run_command(
         for argument in settings.build_command
     ]
     result = _run_process(
-        command, cwd, None, settings.build_timeout, database, build, logfile
+        command,
+        cwd,
+        build_env(),
+        settings.build_timeout,
+        database,
+        build,
+        logfile,
     )
     _stop_unless_succeeded(result, "build command")
 
@@ -469,7 +495,7 @@ def main() -> None:
     )
     settings = config.load_settings()
     store = storage.Storage(settings.data_dir)
-    database = db.Database(store.db_path)
+    database = db.Database(store.db_path, crypto.cipher_for(settings.token_key))
     interrupted = database.fail_interrupted()
     if interrupted:
         _logger.warning("marked %d interrupted build(s) as failed", interrupted)
