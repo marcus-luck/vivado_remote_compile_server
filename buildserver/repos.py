@@ -5,6 +5,10 @@ repositories of it, selects a branch or tag of each, and queues builds of
 them. The worker clones the selected ref with the token of the repository's
 owner. Users see their own repositories; administrators see everybody's.
 
+The rules (connect, refresh, select a ref, queue a build) are plain
+functions that raise NotLinkedError, AlreadyConnectedError, ValueError or
+github.GitHubError. The routes translate those into HTTP responses.
+
 Routes:
 
     /api/repos...           JSON API
@@ -13,6 +17,8 @@ Routes:
 """
 
 from collections.abc import Callable
+from collections.abc import Iterator
+import contextlib
 import sqlite3
 from typing import Any
 from typing import Literal
@@ -21,6 +27,7 @@ import uuid
 import fastapi
 from fastapi import responses
 from fastapi import templating
+import httpx
 import pydantic
 
 from buildserver import auth
@@ -32,6 +39,14 @@ from buildserver import names
 from buildserver import storage
 
 RefType = Literal["branch", "tag"]
+
+
+class NotLinkedError(Exception):
+    """Raised when a user has no linked GitHub account."""
+
+
+class AlreadyConnectedError(Exception):
+    """Raised when a user connects a repository a second time."""
 
 
 class RepoCreate(pydantic.BaseModel):
@@ -92,9 +107,7 @@ def present_repo(repo: db.Repo) -> dict[str, Any]:
 
 def visible_repos(database: db.Database, user: db.User) -> list[db.Repo]:
     """Lists the repositories a user sees: their own, or all for an admin."""
-    if user["role"] == auth.ROLE_ADMIN:
-        return database.list_repos(None)
-    return database.list_repos(user["id"])
+    return database.list_repos(None if auth.is_admin(user) else user["id"])
 
 
 def page_context(
@@ -128,13 +141,247 @@ def page_context(
     }
 
 
-def _http_error(e: github.GitHubError) -> fastapi.HTTPException:
-    """Translates a failed GitHub request into the response to the client."""
-    if e.status == 401:
-        return fastapi.HTTPException(400, e.message)
-    if e.status in (403, 404):
-        return fastapi.HTTPException(422, e.message)
-    return fastapi.HTTPException(502, e.message)
+# Rules #######################################################################
+
+
+def token_of(database: db.Database, user_id: int) -> str:
+    """Returns the GitHub token of a user.
+
+    Args:
+        database: The records.
+        user_id: Id of the user.
+
+    Returns:
+        The access token of the user's linked GitHub account.
+
+    Raises:
+        NotLinkedError: If the user has not linked a GitHub account.
+    """
+    link = database.get_github_link(user_id)
+    if link is None:
+        raise NotLinkedError("link a GitHub account first")
+    return link["access_token"]
+
+
+def fetch_refs(
+    http: httpx.Client, token: str, full_name: str
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Fetches a repository with its branches and tags from GitHub.
+
+    Args:
+        http: The GitHub API client.
+        token: GitHub token to read the repository with.
+        full_name: The repository, "owner/repo".
+
+    Returns:
+        The repository as github.get_repo() returns it, its branch names and
+        its tag names.
+
+    Raises:
+        github.GitHubError: If a GitHub request fails.
+    """
+    info = github.get_repo(http, token, full_name)
+    branches = github.list_branches(http, token, info["full_name"])
+    tags = github.list_tags(http, token, info["full_name"])
+    return info, branches, tags
+
+
+def connect_repo(
+    database: db.Database,
+    http: httpx.Client,
+    user: db.User,
+    text: str,
+    name: str | None,
+) -> db.Repo:
+    """Connects a repository of a user's linked GitHub account.
+
+    Args:
+        database: The records.
+        http: The GitHub API client.
+        user: The user connecting the repository.
+        text: The repository: a GitHub URL or "owner/repo".
+        name: Display name, or None to derive it from the repository name.
+
+    Returns:
+        The new repository record.
+
+    Raises:
+        NotLinkedError: If the user has not linked a GitHub account.
+        ValueError: If the repository or the name is not valid.
+        github.GitHubError: If GitHub refuses or fails a request.
+        AlreadyConnectedError: If the user already connected the repository.
+    """
+    token = token_of(database, user["id"])
+    full_name = github.parse_repo(text)
+    info, branches, tags = fetch_refs(http, token, full_name)
+    name = (name or "").strip() or names.clean(
+        info["full_name"].partition("/")[2]
+    )
+    if not names.NAME_RE.fullmatch(name):
+        raise ValueError(names.NAME_ERROR)
+    try:
+        return database.create_repo(
+            user["id"],
+            info["full_name"],
+            name,
+            info["default_branch"],
+            branches,
+            tags,
+        )
+    except sqlite3.IntegrityError as e:
+        raise AlreadyConnectedError(
+            f"{info['full_name']} is already connected"
+        ) from e
+
+
+def refresh_refs(
+    database: db.Database, http: httpx.Client, repo: db.Repo
+) -> db.Repo:
+    """Refetches a repository's branches and tags, with the owner's token.
+
+    The selected ref is kept if it still exists; otherwise the default
+    branch is selected.
+
+    Args:
+        database: The records.
+        http: The GitHub API client.
+        repo: The repository.
+
+    Returns:
+        The updated repository record.
+
+    Raises:
+        NotLinkedError: If the owner's GitHub account is not linked.
+        github.GitHubError: If GitHub refuses or fails a request.
+    """
+    info, branches, tags = fetch_refs(
+        http, token_of(database, repo["user_id"]), repo["full_name"]
+    )
+    database.update_refs(repo["id"], info["default_branch"], branches, tags)
+    refs = branches if repo["ref_type"] == db.REF_BRANCH else tags
+    if repo["ref"] not in refs:
+        database.select_ref(repo["id"], info["default_branch"], db.REF_BRANCH)
+    return database.get_repo(repo["id"])
+
+
+def check_ref(repo: db.Repo, ref: str, ref_type: str) -> None:
+    """Checks that ref is a known branch or tag of a repository.
+
+    Args:
+        repo: The repository.
+        ref: Name of the branch or tag.
+        ref_type: Whether ref is a branch or a tag.
+
+    Raises:
+        ValueError: If the repository has no such branch or tag.
+    """
+    refs = repo["branches"] if ref_type == db.REF_BRANCH else repo["tags"]
+    if not git.valid_ref(ref) or ref not in refs:
+        raise ValueError(f"{repo['full_name']} has no {ref_type} {ref!r}")
+
+
+def select_ref(
+    database: db.Database, repo: db.Repo, ref: str, ref_type: str
+) -> db.Repo:
+    """Selects the branch or tag a repository is built from.
+
+    Args:
+        database: The records.
+        repo: The repository.
+        ref: Name of the branch or tag.
+        ref_type: Whether ref is a branch or a tag.
+
+    Returns:
+        The updated repository record.
+
+    Raises:
+        ValueError: If the repository has no such branch or tag.
+    """
+    check_ref(repo, ref, ref_type)
+    database.select_ref(repo["id"], ref, ref_type)
+    return database.get_repo(repo["id"])
+
+
+def queue_build(
+    database: db.Database,
+    store: storage.Storage,
+    repo: db.Repo,
+    user: db.User,
+    name: str | None,
+    ref: tuple[str, str] | None,
+) -> db.Build:
+    """Queues a build of a repository's branch or tag.
+
+    Args:
+        database: The records.
+        store: The data directory.
+        repo: The repository.
+        user: The user queueing the build.
+        name: Build name, or None for the repository's name.
+        ref: The branch or tag as (name, ref_type), or None for the
+            selected one.
+
+    Returns:
+        The new build record.
+
+    Raises:
+        ValueError: If the name or ref is not valid.
+    """
+    ref_name, ref_type = ref or (repo["ref"], repo["ref_type"])
+    check_ref(repo, ref_name, ref_type)
+    name = (name or "").strip() or repo["name"]
+    if not names.NAME_RE.fullmatch(name):
+        raise ValueError(names.NAME_ERROR)
+    build_id = uuid.uuid4().hex[:12]
+    store.build_dir(build_id).mkdir(parents=True)
+    return database.create(
+        build_id,
+        name,
+        "",
+        created_by=user["email"],
+        repo_full_name=repo["full_name"],
+        ref=ref_name,
+        ref_type=ref_type,
+        source_user_id=repo["user_id"],
+    )
+
+
+# HTTP ########################################################################
+
+
+def _http_error(e: Exception) -> fastapi.HTTPException:
+    """Translates an error of the rules into the response to the client."""
+    if isinstance(e, github.GitHubError):
+        if e.status == 401:
+            return fastapi.HTTPException(400, e.message)
+        if e.status in (403, 404):
+            return fastapi.HTTPException(422, e.message)
+        return fastapi.HTTPException(502, e.message)
+    if isinstance(e, NotLinkedError):
+        return fastapi.HTTPException(400, str(e))
+    if isinstance(e, AlreadyConnectedError):
+        return fastapi.HTTPException(409, str(e))
+    return fastapi.HTTPException(422, str(e))
+
+
+@contextlib.contextmanager
+def _http_errors() -> Iterator[None]:
+    """Turns the errors the rules raise into HTTP exceptions.
+
+    Raises:
+        fastapi.HTTPException: For NotLinkedError (400), ValueError (422),
+            AlreadyConnectedError (409) and github.GitHubError (400, 422 or
+            502).
+    """
+    try:
+        yield
+    except (
+        NotLinkedError,
+        AlreadyConnectedError,
+        ValueError,
+        github.GitHubError,
+    ) as e:
+        raise _http_error(e) from e
 
 
 def create_router(
@@ -168,152 +415,32 @@ def create_router(
         if not auth_settings.github_enabled:
             raise fastapi.HTTPException(503, "GitHub is not configured")
 
-    def token_of(user_id: int) -> str:
-        """Returns the GitHub token of a user, or raises a 400."""
-        link = database.get_github_link(user_id)
-        if link is None:
-            raise fastapi.HTTPException(400, "link a GitHub account first")
-        return link["access_token"]
+    def http_of(request: fastapi.Request) -> httpx.Client:
+        """Returns the GitHub API client of the application."""
+        return request.app.state.github_http
 
     def get_owned_or_404(repo_id: int, user: db.User) -> db.Repo:
         """Returns a repository the user may use, or raises a 404."""
         repo = database.get_repo(repo_id)
         if repo is None or (
-            repo["user_id"] != user["id"] and user["role"] != auth.ROLE_ADMIN
+            repo["user_id"] != user["id"] and not auth.is_admin(user)
         ):
             raise fastapi.HTTPException(404, "repository not found")
         return repo
 
-    def fetch_refs(
-        request: fastapi.Request, token: str, full_name: str
-    ) -> tuple[dict[str, Any], list[str], list[str]]:
-        """Fetches a repository with its branches and tags from GitHub.
-
-        Returns:
-            The repository as github.get_repo() returns it, its branch names
-            and its tag names.
-
-        Raises:
-            fastapi.HTTPException: If a GitHub request fails.
-        """
-        http = request.app.state.github_http
-        try:
-            info = github.get_repo(http, token, full_name)
-            branches = github.list_branches(http, token, info["full_name"])
-            tags = github.list_tags(http, token, info["full_name"])
-        except github.GitHubError as e:
-            raise _http_error(e) from e
-        return info, branches, tags
-
     def add_repo(
         request: fastapi.Request, user: db.User, text: str, name: str | None
     ) -> db.Repo:
-        """Connects a repository for a user.
-
-        Raises:
-            fastapi.HTTPException: If GitHub is not configured (503) or not
-                linked (400), the repository is not valid or not readable
-                (422), or the user already connected it (409).
-        """
+        """Connects a repository; see connect_repo()."""
         require_github()
-        token = token_of(user["id"])
-        try:
-            full_name = github.parse_repo(text)
-        except ValueError as e:
-            raise fastapi.HTTPException(422, str(e)) from e
-        info, branches, tags = fetch_refs(request, token, full_name)
-        name = (name or "").strip() or names.clean(
-            info["full_name"].partition("/")[2]
-        )
-        if not names.NAME_RE.fullmatch(name):
-            raise fastapi.HTTPException(422, names.NAME_ERROR)
-        try:
-            return database.create_repo(
-                user["id"],
-                info["full_name"],
-                name,
-                info["default_branch"],
-                branches,
-                tags,
-            )
-        except sqlite3.IntegrityError as e:
-            raise fastapi.HTTPException(
-                409, f"{info['full_name']} is already connected"
-            ) from e
+        with _http_errors():
+            return connect_repo(database, http_of(request), user, text, name)
 
     def update_repo(request: fastapi.Request, repo: db.Repo) -> db.Repo:
-        """Refetches a repository's branches and tags, with the owner's token.
-
-        The selected ref is kept if it still exists; otherwise the default
-        branch is selected.
-        """
+        """Refetches a repository's branches and tags; see refresh_refs()."""
         require_github()
-        info, branches, tags = fetch_refs(
-            request, token_of(repo["user_id"]), repo["full_name"]
-        )
-        database.update_refs(repo["id"], info["default_branch"], branches, tags)
-        refs = branches if repo["ref_type"] == db.REF_BRANCH else tags
-        if repo["ref"] not in refs:
-            database.select_ref(
-                repo["id"], info["default_branch"], db.REF_BRANCH
-            )
-        return database.get_repo(repo["id"])
-
-    def check_ref(repo: db.Repo, ref: str, ref_type: str) -> None:
-        """Raises a 422 unless ref is a known branch or tag of the repo."""
-        refs = repo["branches"] if ref_type == db.REF_BRANCH else repo["tags"]
-        if not git.valid_ref(ref) or ref not in refs:
-            raise fastapi.HTTPException(
-                422, f"{repo['full_name']} has no {ref_type} {ref!r}"
-            )
-
-    def select_ref(repo: db.Repo, ref: str, ref_type: str) -> db.Repo:
-        """Selects the branch or tag a repository is built from."""
-        check_ref(repo, ref, ref_type)
-        database.select_ref(repo["id"], ref, ref_type)
-        return database.get_repo(repo["id"])
-
-    def queue_build(
-        repo: db.Repo,
-        user: db.User,
-        name: str | None,
-        ref: str | None,
-        ref_type: str,
-    ) -> db.Build:
-        """Queues a build of a repository's branch or tag.
-
-        Args:
-            repo: The repository.
-            user: The user queueing the build.
-            name: Build name, or None for the repository's name.
-            ref: Branch or tag, or None for the selected one.
-            ref_type: Whether ref is a branch or a tag; ignored if ref is
-                None.
-
-        Returns:
-            The new build record.
-
-        Raises:
-            fastapi.HTTPException: If the name or ref is not valid (422).
-        """
-        if ref is None:
-            ref, ref_type = repo["ref"], repo["ref_type"]
-        check_ref(repo, ref, ref_type)
-        name = (name or "").strip() or repo["name"]
-        if not names.NAME_RE.fullmatch(name):
-            raise fastapi.HTTPException(422, names.NAME_ERROR)
-        build_id = uuid.uuid4().hex[:12]
-        store.build_dir(build_id).mkdir(parents=True)
-        return database.create(
-            build_id,
-            name,
-            "",
-            created_by=user["email"],
-            repo_full_name=repo["full_name"],
-            ref=ref,
-            ref_type=ref_type,
-            source_user_id=repo["user_id"],
-        )
+        with _http_errors():
+            return refresh_refs(database, http_of(request), repo)
 
     # JSON API ################################################################
 
@@ -332,12 +459,10 @@ def create_router(
     ) -> list[dict[str, Any]]:
         """Lists repositories the linked GitHub account can read."""
         require_github()
-        try:
+        with _http_errors():
             return github.list_user_repos(
-                request.app.state.github_http, token_of(user["id"]), q
+                http_of(request), token_of(database, user["id"]), q
             )
-        except github.GitHubError as e:
-            raise _http_error(e) from e
 
     @router.post("/api/repos", status_code=201)
     def create_repo(
@@ -374,14 +499,17 @@ def create_router(
     ) -> dict[str, Any]:
         """Selects the branch or tag a repository is built from."""
         repo = get_owned_or_404(repo_id, user)
-        return present_repo(select_ref(repo, body.ref, body.ref_type))
+        with _http_errors():
+            return present_repo(
+                select_ref(database, repo, body.ref, body.ref_type)
+            )
 
     @router.delete("/api/repos/{repo_id}", status_code=204)
     def delete_repo(
         repo_id: int,
         user: db.User = fastapi.Depends(auth.current_user),
     ) -> None:
-        """Disconnects a repository. Its builds are kept."""
+        """Disconnects a repository and cancels its queued builds."""
         database.delete_repo(get_owned_or_404(repo_id, user)["id"])
 
     @router.post("/api/repos/{repo_id}/builds", status_code=201)
@@ -393,9 +521,10 @@ def create_router(
         """Queues a build of a repository's selected or given branch or tag."""
         body = body or RepoBuild()
         repo = get_owned_or_404(repo_id, user)
-        return present_build(
-            queue_build(repo, user, body.name, body.ref, body.ref_type)
-        )
+        ref = None if body.ref is None else (body.ref, body.ref_type)
+        with _http_errors():
+            build = queue_build(database, store, repo, user, body.name, ref)
+        return present_build(build)
 
     # Front end ###############################################################
 
@@ -446,7 +575,8 @@ def create_router(
             The rendered fragment.
         """
         try:
-            message = action()
+            with _http_errors():
+                message = action()
         except fastapi.HTTPException as e:
             return fragment(request, user, error=e.detail, **context)
         headers = {"HX-Trigger": "refresh"} if refresh_builds else None
@@ -530,8 +660,10 @@ def create_router(
         def action() -> None:
             ref_type, _, name = ref.partition(":")
             if ref_type not in (db.REF_BRANCH, db.REF_TAG):
-                raise fastapi.HTTPException(422, "invalid branch or tag")
-            select_ref(get_owned_or_404(repo_id, user), name, ref_type)
+                raise ValueError("invalid branch or tag")
+            select_ref(
+                database, get_owned_or_404(repo_id, user), name, ref_type
+            )
 
         return ui_action(request, user, action)
 
@@ -547,7 +679,7 @@ def create_router(
 
         def action() -> str:
             repo = get_owned_or_404(repo_id, user)
-            build = queue_build(repo, user, None, None, db.REF_BRANCH)
+            build = queue_build(database, store, repo, user, None, None)
             return (
                 f"Queued {build['name']} from {repo['full_name']}"
                 f" {build['ref']}."

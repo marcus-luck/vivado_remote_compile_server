@@ -22,6 +22,52 @@ from buildserver import storage
 
 _logger = logging.getLogger("buildserver.worker")
 
+# A build directory without a record is only deleted once it is this old: the
+# API creates the directory just before it inserts the record.
+_ORPHAN_GRACE_SECONDS = 3600
+
+
+class BuildStoppedError(Exception):
+    """Raised when a build cannot go on: it failed or was cancelled.
+
+    Attributes:
+        status: The final build status, FAILED or CANCELLED.
+        reason: Why the build stopped, or None for a plain cancel.
+        exit_code: Exit code of the build command, if it ran to the end.
+    """
+
+    def __init__(
+        self, status: str, reason: str | None, exit_code: int | None = None
+    ) -> None:
+        """Creates the exception.
+
+        Args:
+            status: The final build status, FAILED or CANCELLED.
+            reason: Why the build stopped, or None for a plain cancel.
+            exit_code: Exit code of the build command, if it ran to the end.
+        """
+        super().__init__(reason or status)
+        self.status = status
+        self.reason = reason
+        self.exit_code = exit_code
+
+
+def _stop_unless_succeeded(
+    result: tuple[str, int | None, str | None], what: str
+) -> None:
+    """Raises BuildStoppedError unless a process result is a success.
+
+    Args:
+        result: What _run_process() returned.
+        what: Name of the process, prefixed to the reason.
+
+    Raises:
+        BuildStoppedError: If the process failed or the build was cancelled.
+    """
+    status, exit_code, error = result
+    if status != db.SUCCEEDED:
+        raise BuildStoppedError(status, error and f"{what} {error}", exit_code)
+
 
 def kill_tree(process: subprocess.Popen) -> None:
     """Kills a build process together with its children.
@@ -119,7 +165,7 @@ def run_command(
     build: db.Build,
     cwd: pathlib.Path,
     logfile: BinaryIO,
-) -> tuple[str, int | None, str | None]:
+) -> None:
     """Runs the build command and waits for it to end.
 
     The command is killed if the build is cancelled or exceeds the build
@@ -132,19 +178,17 @@ def run_command(
         cwd: Directory to run the command in.
         logfile: Open log file that receives the output of the command.
 
-    Returns:
-        A tuple (status, exit_code, error): the final build status, the exit
-        code of the command (None if it was killed or never started), and a
-        reason for a failure (None otherwise).
+    Raises:
+        BuildStoppedError: If the command failed or the build was cancelled.
     """
     command = [
         argument.replace(config.NAME_PLACEHOLDER, build["name"])
         for argument in settings.build_command
     ]
-    status, exit_code, error = _run_process(
+    result = _run_process(
         command, cwd, None, settings.build_timeout, database, build, logfile
     )
-    return status, exit_code, error and f"build command {error}"
+    _stop_unless_succeeded(result, "build command")
 
 
 def clone_repo(
@@ -153,11 +197,12 @@ def clone_repo(
     build: db.Build,
     dest: pathlib.Path,
     logfile: BinaryIO,
-) -> tuple[str, str | None]:
+) -> None:
     """Clones the branch or tag of a build from a repository.
 
     The clone uses the GitHub token of the user recorded as the build's
-    source, and counts against the build timeout like the build itself.
+    source. It gets a build timeout of its own, separate from the build
+    command's.
 
     Args:
         settings: The server settings.
@@ -166,19 +211,21 @@ def clone_repo(
         dest: Directory to clone into; must not exist.
         logfile: Open log file that receives git's output.
 
-    Returns:
-        A tuple (status, error): SUCCEEDED, FAILED or CANCELLED, and a
-        reason for a failure (None otherwise).
+    Raises:
+        BuildStoppedError: If the owner's GitHub account is not linked,
+            the clone failed, or the build was cancelled.
     """
     link = database.get_github_link(build["source_user_id"])
     if link is None:
         owner = database.get_user(build["source_user_id"])
         who = owner["email"] if owner else "the repository's owner"
-        return db.FAILED, f"GitHub account of {who} is not linked"
+        raise BuildStoppedError(
+            db.FAILED, f"GitHub account of {who} is not linked"
+        )
     command = git.clone_command(
         settings.git, build["repo_full_name"], build["ref"], dest
     )
-    status, _, error = _run_process(
+    result = _run_process(
         command,
         dest.parent,
         git.clone_env(link["access_token"]),
@@ -187,10 +234,8 @@ def clone_repo(
         build,
         logfile,
     )
-    if status != db.SUCCEEDED:
-        return status, error and f"git clone {error}"
+    _stop_unless_succeeded(result, "git clone")
     database.set_commit(build["id"], git.head_commit(settings.git, dest))
-    return db.SUCCEEDED, None
 
 
 def prepare_source(
@@ -199,7 +244,7 @@ def prepare_source(
     store: storage.Storage,
     build: db.Build,
     logfile: BinaryIO,
-) -> tuple[pathlib.Path | None, str, str | None]:
+) -> pathlib.Path:
     """Puts the source of a build in its work directory.
 
     The source is the uploaded package, extracted, or a clone of the
@@ -213,29 +258,27 @@ def prepare_source(
         logfile: Open log file of the build.
 
     Returns:
-        A tuple (root, status, error): the directory holding the build
-        script, or None if the build cannot go on; and, when it cannot, the
-        status (FAILED or CANCELLED) and the reason.
+        The directory holding the build script.
+
+    Raises:
+        BuildStoppedError: If the source cannot be had or holds no build script.
     """
     work_dir = store.work_dir(build["id"])
     shutil.rmtree(work_dir, ignore_errors=True)
     if build["repo_full_name"]:
-        status, error = clone_repo(settings, database, build, work_dir, logfile)
-        if status != db.SUCCEEDED:
-            return None, status, error
+        clone_repo(settings, database, build, work_dir, logfile)
         source = "repository"
     else:
         storage.extract_package(store.package_path(build["id"]), work_dir)
         source = "package"
     root = storage.find_build_root(work_dir, settings.build_script)
     if root is None:
-        return (
-            None,
+        raise BuildStoppedError(
             db.FAILED,
             f"{settings.build_script} not found at the top level of the"
             f" {source}",
         )
-    return root, db.SUCCEEDED, None
+    return root
 
 
 def run_build(
@@ -265,13 +308,11 @@ def run_build(
         with open(log_path, "wb") as logfile:
             # One failing build must not take the worker down.
             try:
-                root, status, error = prepare_source(
-                    settings, database, store, build, logfile
-                )
-                if root is not None:
-                    status, exit_code, error = run_command(
-                        settings, database, build, root, logfile
-                    )
+                root = prepare_source(settings, database, store, build, logfile)
+                run_command(settings, database, build, root, logfile)
+                status, exit_code = db.SUCCEEDED, 0
+            except BuildStoppedError as e:
+                status, exit_code, error = e.status, e.exit_code, e.reason
             except Exception as e:  # pylint: disable=broad-exception-caught
                 _logger.exception("build %s failed", build_id)
                 status, error = db.FAILED, f"{type(e).__name__}: {e}"
@@ -381,6 +422,46 @@ def expire_old_files(
     return expired
 
 
+def delete_orphaned_dirs(
+    database: db.Database,
+    store: storage.Storage,
+    now: float | None = None,
+) -> int:
+    """Deletes build directories whose build record is gone.
+
+    A build delete that could not remove every file leaves such a directory.
+    Directories younger than an hour are left alone, because a build's
+    directory is created just before its record.
+
+    Args:
+        database: The build records.
+        store: The data directory.
+        now: The current time, as time.time() gives it. Defaults to the
+            clock.
+
+    Returns:
+        The number of directories deleted.
+    """
+    now = time.time() if now is None else now
+    deleted = 0
+    for build_dir in store.build_dirs():
+        build_id = build_dir.name
+        if database.get(build_id) is not None:
+            continue
+        try:
+            if now - build_dir.stat().st_mtime < _ORPHAN_GRACE_SECONDS:
+                continue
+            store.delete_build_dir(build_id)
+        except OSError as e:
+            _logger.warning(
+                "could not delete files of deleted build %s: %s", build_id, e
+            )
+            continue
+        _logger.info("deleted files of deleted build %s", build_id)
+        deleted += 1
+    return deleted
+
+
 def main() -> None:
     """Runs the worker until it is interrupted."""
     logging.basicConfig(
@@ -405,6 +486,7 @@ def main() -> None:
         while True:
             if time.monotonic() >= next_expiry:
                 expire_old_files(settings, database, store)
+                delete_orphaned_dirs(database, store)
                 next_expiry = time.monotonic() + settings.retention_interval
             if not run_once(settings, database, store):
                 time.sleep(settings.poll_interval)

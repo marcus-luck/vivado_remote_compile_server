@@ -379,12 +379,33 @@ def test_update_fetches_refs_and_falls_back_to_default(env, dev):
     assert repo["ref"] == "main"
 
 
-def test_delete_keeps_builds(dev):
+def test_delete_keeps_builds_and_cancels_queued_ones(env, dev):
+    settings, database, store, _, _ = env
     repo_id = add_repo(dev).json()["id"]
-    build = dev.post(f"/api/repos/{repo_id}/builds").json()
+    done = dev.post(f"/api/repos/{repo_id}/builds").json()
+    worker.run_once(settings, database, store)
+    queued = dev.post(f"/api/repos/{repo_id}/builds").json()
     assert dev.delete(f"/api/repos/{repo_id}").status_code == 204
     assert dev.get("/api/repos").json() == []
-    assert dev.get(f"/api/builds/{build['id']}").status_code == 200
+
+    assert dev.get(f"/api/builds/{done['id']}").json()["status"] == "succeeded"
+    queued = dev.get(f"/api/builds/{queued['id']}").json()
+    assert queued["status"] == "cancelled"
+    assert queued["error"] == "repository disconnected"
+    assert worker.run_once(settings, database, store) is False
+
+
+def test_deleting_the_owner_cancels_queued_builds(env, dev, admin):
+    settings, database, store, _, _ = env
+    repo_id = add_repo(dev).json()["id"]
+    build = dev.post(f"/api/repos/{repo_id}/builds").json()
+    dev_id = dev.get("/api/me").json()["id"]
+    assert admin.delete(f"/api/users/{dev_id}").status_code == 204
+
+    build = admin.get(f"/api/builds/{build['id']}").json()
+    assert build["status"] == "cancelled"
+    assert build["error"] == "repository owner removed"
+    assert worker.run_once(settings, database, store) is False
 
 
 # Builds #####################################################################

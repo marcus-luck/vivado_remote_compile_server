@@ -11,6 +11,7 @@ here except / requires a signed-in user or an API token.
 """
 
 import datetime
+import logging
 import pathlib
 import shutil
 import uuid
@@ -31,6 +32,8 @@ from buildserver import github
 from buildserver import names
 from buildserver import repos
 from buildserver import storage
+
+_logger = logging.getLogger("buildserver.api")
 
 _PACKAGE_DIR = pathlib.Path(__file__).parent
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -116,10 +119,7 @@ def create_app(
 
     def can_delete(build: db.Build, user: db.User) -> bool:
         """Tells whether a user may delete a build: its creator or an admin."""
-        return (
-            user["role"] == auth.ROLE_ADMIN
-            or build["created_by"] == user["email"]
-        )
+        return auth.is_admin(user) or build["created_by"] == user["email"]
 
     def present_all(user: db.User) -> list[db.Build]:
         """Returns the recent builds as they are shown in the build table.
@@ -169,7 +169,14 @@ def create_app(
             )
         if not database.delete_build(build_id):
             raise fastapi.HTTPException(409, "cancel the running build first")
-        store.delete_build_dir(build_id)
+        try:
+            store.delete_build_dir(build_id)
+        except OSError as e:
+            # The record is gone; the worker's retention pass removes the
+            # rest of the directory later.
+            _logger.warning(
+                "could not delete files of build %s: %s", build_id, e
+            )
 
     def store_upload(
         package: fastapi.UploadFile, name: str | None, user: db.User

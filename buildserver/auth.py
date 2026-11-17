@@ -38,6 +38,7 @@ import fastapi
 from fastapi import responses
 from fastapi import security
 import pydantic
+from starlette import concurrency
 
 from buildserver import config
 from buildserver import db
@@ -114,6 +115,11 @@ class TokenCreate(pydantic.BaseModel):
     expires_in_days: int | None = pydantic.Field(
         default=None, ge=1, le=_MAX_TOKEN_DAYS
     )
+
+
+def is_admin(user: db.User) -> bool:
+    """Tells whether a user is an administrator."""
+    return user["role"] == ROLE_ADMIN
 
 
 def present_user(user: db.User) -> dict[str, Any]:
@@ -206,7 +212,7 @@ def revoke_token(database: db.Database, user: db.User, token_id: int) -> bool:
     token = database.get_token(token_id)
     if token is None:
         return False
-    if token["user_id"] != user["id"] and user["role"] != ROLE_ADMIN:
+    if token["user_id"] != user["id"] and not is_admin(user):
         return False
     return database.delete_token(token_id)
 
@@ -337,7 +343,7 @@ def admin_user(
         fastapi.HTTPException: With status 403 if the user is not an
             administrator.
     """
-    if user["role"] != ROLE_ADMIN:
+    if not is_admin(user):
         raise fastapi.HTTPException(403, "administrators only")
     return user
 
@@ -530,8 +536,11 @@ def create_router(
             )
             return responses.RedirectResponse(home_url, status_code=303)
         try:
-            account = github.get_user(
-                request.app.state.github_http, token["access_token"]
+            # Synchronous httpx call: keep it off the event loop.
+            account = await concurrency.run_in_threadpool(
+                github.get_user,
+                request.app.state.github_http,
+                token["access_token"],
             )
         except github.GitHubError as e:
             request.session[_SESSION_GITHUB_MESSAGE] = (

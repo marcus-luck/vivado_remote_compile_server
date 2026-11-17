@@ -116,7 +116,9 @@ of a build that died in routing are still downloadable.
 
 *Delete* in the build table (or `DELETE /api/builds/{id}`) removes a build and
 all its files. Only the user who queued it, or an admin, can delete a build; a
-running build has to be cancelled first.
+running build has to be cancelled first. If a file cannot be deleted (a
+download holds it open on Windows, say), the worker's hourly pass removes the
+leftover directory later.
 
 With `BUILDSERVER_RETENTION_DAYS` set, the worker deletes the package and the
 artifact zip of every build that finished more than that many days ago. It
@@ -128,7 +130,7 @@ with its log and is marked *files expired*. Unset or `0` keeps files forever.
 Instead of uploading a package, a user can link their GitHub account and
 connect repositories of it. Each connected repository has a selected branch or
 tag; *Build* queues a build of it, *Update* refetches the branches and tags from
-GitHub, *Delete* disconnects it (its builds are kept). The worker makes a
+GitHub, *Delete* disconnects it (its builds are kept, its queued builds cancelled). The worker makes a
 shallow clone of the branch tip or the tagged commit, with submodules, and
 builds it like an extracted package: `build.tcl` must be at the top of the
 repository. The build records the commit it built.
@@ -232,7 +234,7 @@ package and artifacts.
 | `GET` | `/api/repos/{id}` | One repository, with its `branches` and `tags` |
 | `POST` | `/api/repos/{id}/fetch` | Refetch branches and tags from GitHub |
 | `PATCH` | `/api/repos/{id}` | Select what to build. JSON: `{"ref": ..., "ref_type": "branch" \| "tag"}` |
-| `DELETE` | `/api/repos/{id}` | Disconnect; builds are kept |
+| `DELETE` | `/api/repos/{id}` | Disconnect; builds are kept, queued ones cancelled |
 | `POST` | `/api/repos/{id}/builds` | Queue a build. Optional JSON: `{"name": ..., "ref": ..., "ref_type": ...}`; defaults are the repository's name and selected ref |
 
 Linking is done in the browser: `/auth/github/login` and `POST /auth/github/unlink`.
@@ -247,7 +249,7 @@ Linking is done in the browser: `/auth/github/login` and `POST /auth/github/unli
 | `POST` | `/api/users` | Add a user. JSON: `{"email": ..., "role": "user" \| "admin", "is_service": false}` (admins) |
 | `GET` | `/api/users/{id}` | One user (admins) |
 | `PATCH` | `/api/users/{id}` | Change `role` and/or `is_active` (admins) |
-| `DELETE` | `/api/users/{id}` | Remove a user and their tokens; their builds are kept (admins) |
+| `DELETE` | `/api/users/{id}` | Remove a user and their tokens; their builds are kept, queued builds of their repositories cancelled (admins) |
 
 Admins cannot demote, deactivate or delete their own account.
 

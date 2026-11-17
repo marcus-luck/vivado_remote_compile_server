@@ -406,6 +406,29 @@ def test_ui_delete(env):
     assert "doomed" not in table and "No builds yet." in table
 
 
+def test_files_left_by_a_failed_delete_are_swept_later(env, monkeypatch):
+    settings, database, store, client = env
+    gone = upload(client, make_package(GOOD_BUILD), name="gone").json()
+    kept = upload(client, make_package(GOOD_BUILD), name="kept").json()
+    worker.run_once(settings, database, store)
+
+    def locked(self, build_id):
+        raise PermissionError(f"{build_id}/artifacts.zip is open")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage.Storage, "delete_build_dir", locked)
+        assert client.delete(f"/api/builds/{gone['id']}").status_code == 204
+    assert client.get(f"/api/builds/{gone['id']}").status_code == 404
+    assert store.build_dir(gone["id"]).is_dir()
+
+    # Young directories may belong to a build being created: left alone.
+    assert worker.delete_orphaned_dirs(database, store) == 0
+    later = time.time() + 2 * 3600
+    assert worker.delete_orphaned_dirs(database, store, later) == 1
+    assert not store.build_dir(gone["id"]).exists()
+    assert store.package_path(kept["id"]).is_file()
+
+
 def test_retention_expires_old_files_and_keeps_log(env):
     settings, database, store, client = env
     old = upload(client, make_package(GOOD_BUILD), name="old").json()

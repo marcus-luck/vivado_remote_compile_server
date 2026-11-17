@@ -10,7 +10,8 @@ Layout:
                                           build
 
 The retention pass of the worker deletes the package and artifacts of old
-builds; their logs stay.
+builds; their logs stay. It also deletes build directories whose build
+record is gone, which a failed delete can leave behind.
 """
 
 import os
@@ -79,8 +80,23 @@ class Storage:
         self.artifacts_path(build_id).unlink(missing_ok=True)
 
     def delete_build_dir(self, build_id: str) -> None:
-        """Deletes all files of a build. Files that cannot be deleted stay."""
-        shutil.rmtree(self.build_dir(build_id), ignore_errors=True)
+        """Deletes all files of a build.
+
+        Args:
+            build_id: Id of the build.
+
+        Raises:
+            OSError: If a file cannot be deleted, for example because a
+                download holds it open on Windows. The files that could be
+                deleted are gone.
+        """
+        build_dir = self.build_dir(build_id)
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+
+    def build_dirs(self) -> list[pathlib.Path]:
+        """Lists the build directories, one per build id."""
+        return [path for path in self.builds_dir.iterdir() if path.is_dir()]
 
 
 def extract_package(zip_path: pathlib.Path, dest: pathlib.Path) -> None:

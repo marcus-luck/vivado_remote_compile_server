@@ -526,6 +526,9 @@ class Database:
     def delete_user(self, user_id: int) -> bool:
         """Removes a user, their API tokens, GitHub link and repositories.
 
+        Queued builds of the user's repositories are cancelled, whoever
+        queued them. The user's builds themselves are kept.
+
         Args:
             user_id: Id of the user.
 
@@ -533,6 +536,12 @@ class Database:
             True if the user existed.
         """
         with self._connect() as conn:
+            _cancel_queued(
+                conn,
+                "repository owner removed",
+                "source_user_id = ?",
+                (user_id,),
+            )
             for table in ("api_tokens", "github_links", "repos"):
                 conn.execute(
                     f"DELETE FROM {table} WHERE user_id = ?", (user_id,)
@@ -866,7 +875,10 @@ class Database:
             )
 
     def delete_repo(self, repo_id: int) -> bool:
-        """Disconnects a repository. Its builds are kept.
+        """Disconnects a repository and cancels its queued builds.
+
+        The other builds of the repository are kept. A running build goes
+        on.
 
         Args:
             repo_id: Id of the repository.
@@ -875,8 +887,41 @@ class Database:
             True if the repository existed.
         """
         with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
-        return cursor.rowcount > 0
+            row = conn.execute(
+                "SELECT user_id, full_name FROM repos WHERE id = ?", (repo_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            _cancel_queued(
+                conn,
+                "repository disconnected",
+                "source_user_id = ? AND repo_full_name = ?",
+                (row["user_id"], row["full_name"]),
+            )
+            conn.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
+        return True
+
+
+def _cancel_queued(
+    conn: sqlite3.Connection,
+    reason: str,
+    where: str,
+    params: tuple[Any, ...],
+) -> None:
+    """Cancels the queued builds that match a condition.
+
+    Args:
+        conn: Open connection, inside the caller's transaction.
+        reason: Recorded as the error of each cancelled build.
+        where: SQL condition on the builds table. Written by this module
+            only, never from user input.
+        params: Values of the condition's placeholders.
+    """
+    conn.execute(
+        "UPDATE builds SET status = ?, finished_at = ?, error = ?"
+        f" WHERE status = ? AND {where}",
+        (CANCELLED, now(), reason, QUEUED, *params),
+    )
 
 
 def _repo(row: sqlite3.Row) -> Repo:
