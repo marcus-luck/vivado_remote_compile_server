@@ -15,6 +15,9 @@
 #
 # See "Deployment (Docker)" in README.md.
 
+# The cmd_* functions are called through "cmd_$command".
+# shellcheck disable=SC2329
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
@@ -194,11 +197,11 @@ cmd_provision() {
   systemctl daemon-reload
   systemctl enable --now buildserver-backup.timer >/dev/null 2>&1
 
-  local missing
+  local missing line
   missing="$(missing_settings)"
   if [[ -n "$missing" ]]; then
     log "fill in before the first deploy:"
-    sed 's/^/    /' <<<"$missing" >&2
+    while read -r line; do printf '    %s\n' "$line" >&2; done <<<"$missing"
   else
     log "host ready: run $0 deploy"
   fi

@@ -18,6 +18,8 @@ Two processes (the `api` and `worker` containers) sharing one `.env` and one dat
 - `buildserver/crypto.py`: Fernet encryption of the GitHub tokens in `github_links` (`BUILDSERVER_TOKEN_KEY`; `db.Database` takes the cipher, encrypts on write, decrypts on read, migrates plaintext rows on open). The build command gets `worker.build_env()`: the environment without `BUILDSERVER_*` and `GIT_CONFIG_*`.
 - `buildserver/db.py`: SQLite `builds` table, which is also the task queue (oldest `queued` row is claimed), `users`, `api_tokens`, `github_links` and `repos` tables.
 - `buildserver/storage.py`: on-disk layout and zip handling.
+- `buildserver/admin.py`: `python -m buildserver.admin busy|backup|restore`, run inside the containers by `deploy/buildserverctl`; backup and restore take `-` to stream the database through stdout/stdin.
+- `deploy/buildserverctl`: bash, on the host, from its git checkout (e.g. `/opt/buildserver`). `provision` (sudo: Docker, `.env` with generated secrets, `/var/backups/buildserver`, the `deploy/buildserver-backup.*` systemd timer), `deploy [ref]` (refuses while a build runs, backup, checkout, `test`, `compose up`, waits for `/healthz`, rolls back on failure, appends to git-ignored `.deploy-history`), `rollback`, `status`, `logs`, `backup`, `restore`, `test`. Its body is only functions plus a last `main "$@"; exit` line, so a checkout can replace the file mid-deploy.
 - `buildserver/config.py`: settings from `BUILDSERVER_*` variables in `.env` (see `.env.template`); the real environment overrides the file. No paths are hardcoded in the code: every path setting is required and comes from `.env`.
 - `buildserver/templates/`: htmx front end. `index.html` is the page; the `_*.html` fragments are what `/ui/...` returns for htmx to swap in. No build step.
 - `buildserver/static/`: stylesheet, vendored htmx, a few lines of JS.
@@ -47,8 +49,12 @@ share the `data` volume (0700, user `app`). Google sign-in needs HTTPS, so
 don't publish the api port.
 
 ```
-docker compose up -d --build
-docker compose logs -f worker
+sudo deploy/buildserverctl provision
+deploy/buildserverctl deploy [ref]
+deploy/buildserverctl status
+deploy/buildserverctl logs worker
+deploy/buildserverctl backup
+docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable deploy/buildserverctl
 docker build --target worker-test -t buildserver-test .
 docker run --rm --init -e BUILDSERVER_TEST_SANDBOX=1 buildserver-test
 uv run uvicorn --factory buildserver.api:create_app --host 127.0.0.1 --port 8000

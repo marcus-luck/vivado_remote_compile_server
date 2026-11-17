@@ -1,0 +1,12 @@
+# Runs buildserver-backup.service every night; a missed run is made up at
+# the next boot.
+[Unit]
+Description=Daily backup of the build server database
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

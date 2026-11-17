@@ -23,28 +23,76 @@ The database, packages, logs and artifacts live in the `data` volume. Vivado
 is not in any image: the host's Linux install is mounted read-only into the
 worker at `/opt/Xilinx`.
 
-Setup, once:
+`deploy/buildserverctl` sets up the host and deploys, from a git checkout of
+this repository on the host. It runs as a deploy account in group `docker`;
+only `provision` needs sudo.
 
-1. Install Docker with the compose plugin, and the Linux Vivado at
-   `/opt/Xilinx` (or set `VIVADO_DIR=/path/to/Xilinx` in `.env`).
-2. Copy `.env.template` to `.env` and fill it in. `BUILDSERVER_VIVADO` is the
-   path inside the container, e.g. `/opt/Xilinx/Vivado/2024.2/bin/vivado`.
-   The compose file sets the data, work and build-account variables itself.
-3. Copy `deploy/caddy.env.template` to `deploy/caddy.env` and put the
-   Cloudflare token there.
-4. Start everything:
+### Host
 
-   ```
-   docker compose up -d --build
-   docker compose logs -f worker
-   ```
+- Ubuntu with systemd, `git`, `curl` and `python3`.
+- The Linux Vivado at `/opt/Xilinx` (or set `VIVADO_DIR=/path/to/Xilinx` in
+  `.env`). The image is Ubuntu 22.04, so the host OS does not have to be one
+  Vivado supports. An Artix-7-only install of 2025.2 downloads 17 GB; leave
+  room for the build packages and artifacts too.
+- In a VirtualBox VM, a bridged adapter over Wi-Fi is slow (tens of KB/s).
+  Add a NAT adapter and route internet traffic through it, keeping the bridged
+  one for the LAN address.
 
-To upgrade, pull and run `docker compose up -d --build` again; a restarting
-worker marks the build it was running as failed. Back up the `data` volume,
-e.g. `docker run --rm -v buildserver_data:/data -v "$PWD":/backup ubuntu tar
-czf /backup/data.tgz -C /data .`, together with `.env`: without
-`BUILDSERVER_TOKEN_KEY` the stored GitHub tokens cannot be read. Run a single
-worker: builds are serialised on purpose (Vivado is CPU and memory bound).
+### Setup, once
+
+```
+sudo git clone https://github.com/marcus-luck/vivado_remote_compile_server.git /opt/buildserver
+sudo chown -R "$USER": /opt/buildserver
+sudo /opt/buildserver/deploy/buildserverctl provision
+```
+
+`provision`:
+- installs Docker if it is missing and adds you to group `docker`;
+- creates `.env`, with a new session secret and token key and the Vivado it
+  finds, and `deploy/caddy.env`;
+- creates the backup directory `/var/backups/buildserver` and a daily backup
+  timer;
+- lists what is still to be filled in: the Google client,
+  `BUILDSERVER_PUBLIC_URL` (`https://` and the Caddy host name), the admin
+  emails and the Cloudflare token.
+
+Running it again changes nothing that is already set up. Log in again after
+it, so that group `docker` applies.
+
+### Deploying
+
+```
+deploy/buildserverctl deploy                    # main
+deploy/buildserverctl deploy v1.2               # a tag, a branch or a SHA
+deploy/buildserverctl status
+deploy/buildserverctl logs worker
+deploy/buildserverctl rollback
+```
+
+A deploy:
+1. refuses while a build is running (`--force` fails that build);
+2. takes a backup;
+3. checks out the ref and runs the tests in the worker image, sandbox tests
+   included; if they fail, nothing changes;
+4. rebuilds and restarts the containers, then waits for the api's
+   `/healthz`. If the new version is not healthy within two minutes, it goes
+   back to the previous one.
+
+`.deploy-history` records each deploy; `rollback` deploys the one before
+the current, without the tests. Run a single worker: builds are serialised
+on purpose (Vivado is CPU and memory bound).
+
+### Backups
+
+`deploy/buildserverctl backup` copies the live database and `.env` to
+`/var/backups/buildserver` and keeps the newest 14 of each; the timer runs it
+every night, and every deploy runs it too. `.env` goes with the database
+because without its `BUILDSERVER_TOKEN_KEY` the stored GitHub tokens cannot
+be read. Copy the directory off the host as well.
+
+`deploy/buildserverctl restore /var/backups/buildserver/builds-<date>.db`
+backs up the current database, stops the api and the worker, checks the file
+and puts it in place. Packages, logs and artifacts are not in the backup.
 
 ### Build isolation
 
@@ -223,6 +271,10 @@ https or SSH (`git@github.com:...` is rewritten to https); submodules hosted
 elsewhere are not supported, since git is only allowed to use https.
 
 ## API
+
+`GET /healthz` needs no sign-in: it returns `{"status": "ok"}` if the server
+can read its database, else 503. Docker's health check and
+`deploy/buildserverctl` use it.
 
 ### Authentication
 
