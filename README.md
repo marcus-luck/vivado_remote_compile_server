@@ -27,37 +27,113 @@ worker at `/opt/Xilinx`.
 this repository on the host. It runs as a deploy account in group `docker`;
 only `provision` needs sudo.
 
-### Host
+### New server, step by step
 
-- Ubuntu with systemd, `git`, `curl` and `python3`.
-- The Linux Vivado at `/opt/Xilinx` (or set `VIVADO_DIR=/path/to/Xilinx` in
-  `.env`). The image is Ubuntu 22.04, so the host OS does not have to be one
-  Vivado supports. An Artix-7-only install of 2025.2 downloads 17 GB; leave
-  room for the build packages and artifacts too.
-- In a VirtualBox VM, a bridged adapter over Wi-Fi is slow (tens of KB/s).
-  Add a NAT adapter and route internet traffic through it, keeping the bridged
-  one for the LAN address.
+Run the commands on the server, as the account that will deploy (not root),
+unless a step says otherwise.
 
-### Setup, once
+1. **Machine.** Ubuntu Server (any recent release: the containers are Ubuntu
+   22.04, which Vivado supports) with the OpenSSH server. At least 8 cores,
+   16 GB RAM and 150 GB disk; Vivado alone takes 17 GB for Artix-7.
+   - The Ubuntu installer gives the root volume only part of the disk. Grow
+     it: `sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv`.
+   - Hyper-V: a Generation 2 VM boots Ubuntu only with the Secure Boot
+     template *Microsoft UEFI Certificate Authority*. Use static memory and
+     turn automatic checkpoints off. The *Default Switch* is reachable only
+     from the Hyper-V host and changes address on reboots; use an *External*
+     switch for a fixed LAN address.
+   - VirtualBox on a Windows host with Hyper-V enabled (Docker Desktop, WSL2)
+     runs on top of Hyper-V and freezes under load: use Hyper-V instead.
+     Bridged over Wi-Fi it is also slow; add a NAT adapter for internet
+     traffic.
 
-```
-sudo git clone https://github.com/marcus-luck/vivado_remote_compile_server.git /opt/buildserver
-sudo chown -R "$USER": /opt/buildserver
-sudo /opt/buildserver/deploy/buildserverctl provision
-```
+2. **Checkout and provision.**
 
-`provision`:
-- installs Docker if it is missing and adds you to group `docker`;
-- creates `.env`, with a new session secret and token key and the Vivado it
-  finds, and `deploy/caddy.env`;
-- creates the backup directory `/var/backups/buildserver` and a daily backup
-  timer;
-- lists what is still to be filled in: the Google client,
-  `BUILDSERVER_PUBLIC_URL` (`https://` and the Caddy host name), the admin
-  emails and the Cloudflare token.
+   ```
+   sudo apt-get install -y git curl
+   sudo git clone https://github.com/marcus-luck/vivado_remote_compile_server.git /opt/buildserver
+   sudo chown -R "$USER": /opt/buildserver
+   sudo /opt/buildserver/deploy/buildserverctl provision
+   ```
 
-Running it again changes nothing that is already set up. Log in again after
-it, so that group `docker` applies.
+   `provision` installs Docker and adds you to group `docker` (log in again
+   afterwards), creates `.env` with a new session secret and token key and
+   `deploy/caddy.env`, creates `/var/backups/buildserver` with a nightly
+   backup timer, and lists the settings still empty. Running it again changes
+   nothing that is set up.
+
+3. **Vivado.** Download the Linux *Unified Installer* (web installer, `.bin`)
+   from AMD and copy it to the server. Then:
+
+   ```
+   sudo install -d -o "$USER" -g "$USER" /opt/Xilinx
+   chmod +x FPGAs_AdaptiveSoCs_Unified_*_Lin64.bin
+   ./FPGAs_AdaptiveSoCs_Unified_*_Lin64.bin --noexec --keep --target ~/xinstall
+   cd ~/xinstall
+   ./xsetup -b ConfigGen          # choose 2 (Vivado), then 1 (ML Standard)
+   ```
+
+   Edit `~/.Xilinx/install_config.txt`: `Destination=/opt/Xilinx`, set the
+   device families you build for to `:1` (e.g. `Artix-7 FPGAs:1`) and the
+   rest, DocNav and Model Composer included, to `:0`. Then sign in to AMD and
+   install:
+
+   ```
+   ./xsetup -b AuthTokenGen       # your AMD account; not with sudo
+   _JAVA_OPTIONS=-Djava.net.preferIPv4Stack=true \
+     ./xsetup -b Install -a XilinxEULA,3rdPartyEULA -c ~/.Xilinx/install_config.txt
+   ```
+
+   The token lasts about a week. A failed download leaves a broken partial
+   file: delete `/opt/Xilinx/Downloads` before trying again. ML Standard needs
+   no licence. Install Vivado before step 2's `provision`, or set
+   `BUILDSERVER_VIVADO` by hand (step 7). Vivado may not start on the host
+   itself (missing locale and libraries); that is fine, builds run it in the
+   worker container.
+
+4. **Google sign-in.** In the Google Cloud console, APIs & Services >
+   Credentials, create an OAuth client ID of type *Web application*, with
+   `https://buildserver.drystone.solutions/auth/callback` as an authorised
+   redirect URI.
+
+5. **Cloudflare token.** Cloudflare dashboard > My Profile > API Tokens >
+   Create Token, template *Edit zone DNS*, zone `drystone.solutions`. Caddy
+   uses it for the certificate (see "HTTPS on the local network").
+
+6. **DNS.** On the local DNS server, point `buildserver.drystone.solutions`
+   at the server's LAN address.
+
+7. **Settings.** Fill in what `provision` listed:
+
+   | File | Setting |
+   | --- | --- |
+   | `.env` | `BUILDSERVER_PUBLIC_URL=https://buildserver.drystone.solutions` |
+   | `.env` | `BUILDSERVER_GOOGLE_CLIENT_ID`, `BUILDSERVER_GOOGLE_CLIENT_SECRET` (step 4) |
+   | `.env` | `BUILDSERVER_ADMIN_EMAILS`: your Google account |
+   | `.env` | `BUILDSERVER_VIVADO`: set by `provision` if Vivado was installed first, else e.g. `/opt/Xilinx/2025.2/Vivado/bin/vivado` |
+   | `deploy/caddy.env` | `CLOUDFLARE_API_TOKEN` (step 5) |
+
+   Optional: GitHub repository builds (`BUILDSERVER_GITHUB_CLIENT_ID`,
+   `BUILDSERVER_GITHUB_CLIENT_SECRET`, see "Repositories and GitHub").
+   Keep a copy of `BUILDSERVER_TOKEN_KEY` somewhere safe.
+
+8. **Deploy.**
+
+   ```
+   cd /opt/buildserver
+   deploy/buildserverctl deploy        # or a branch, e.g. deploy my-branch
+   deploy/buildserverctl status
+   ```
+
+   The first deploy builds the images and runs the tests: allow about
+   15 minutes. `status` shows `api: healthy` when it is up.
+
+9. **Check.** Open `https://buildserver.drystone.solutions` and sign in with
+   the admin account. The first certificate takes a minute;
+   `deploy/buildserverctl logs caddy` shows its progress ("certificate
+   obtained successfully"). Queue a small build to check Vivado. Before DNS
+   is in place, test from another machine with
+   `curl --resolve buildserver.drystone.solutions:443:<server-ip> https://buildserver.drystone.solutions/healthz`.
 
 ### Deploying
 
