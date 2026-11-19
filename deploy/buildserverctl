@@ -12,6 +12,7 @@
 #   deploy/buildserverctl backup           copy the database and .env
 #   deploy/buildserverctl restore <file>   replace the database
 #   deploy/buildserverctl test             run the tests in the worker image
+#   deploy/buildserverctl ca-cert          print Caddy's root certificate
 #
 # See "Deployment (Docker)" in README.md.
 
@@ -93,9 +94,23 @@ missing_settings() {
   if [[ "$(env_value BUILDSERVER_PUBLIC_URL "$ROOT/.env")" != https://* ]]; then
     echo ".env: BUILDSERVER_PUBLIC_URL (must be https://, the Caddy host name)"
   fi
-  if [[ -z "$(env_value CLOUDFLARE_API_TOKEN "$ROOT/deploy/caddy.env" 2>/dev/null)" ]]; then
-    echo "deploy/caddy.env: CLOUDFLARE_API_TOKEN"
-  fi
+  [[ -f "$ROOT/deploy/caddy.env" ]] || { echo "deploy/caddy.env (file missing)"; return; }
+  case "$(caddy_tls)" in
+    internal) ;;
+    cloudflare)
+      if [[ -z "$(env_value CLOUDFLARE_API_TOKEN "$ROOT/deploy/caddy.env")" ]]; then
+        echo "deploy/caddy.env: CLOUDFLARE_API_TOKEN"
+      fi
+      ;;
+    *) echo "deploy/caddy.env: CADDY_TLS (cloudflare or internal)" ;;
+  esac
+}
+
+# Prints the certificate type set in caddy.env; cloudflare when unset.
+caddy_tls() {
+  local value
+  value="$(env_value CADDY_TLS "$ROOT/deploy/caddy.env" 2>/dev/null)"
+  echo "${value:-cloudflare}"
 }
 
 api_running() {
@@ -329,6 +344,14 @@ cmd_backup() {
   log "backup: $dest"
 }
 
+# Prints the root certificate of Caddy's own CA (CADDY_TLS=internal), for
+# the clients to trust.
+cmd_ca-cert() {
+  [[ "$(caddy_tls)" == internal ]] \
+    || die "CADDY_TLS is $(caddy_tls); only internal certificates have a local CA"
+  compose exec -T caddy cat /data/caddy/pki/authorities/local/root.crt
+}
+
 cmd_restore() {
   local file="${1:-}"
   [[ -n "$file" ]] || die "usage: $0 restore <backup file>"
@@ -352,7 +375,7 @@ main() {
   shift
   cd "$ROOT"
   case "$command" in
-    provision | deploy | rollback | status | logs | backup | restore | test)
+    provision | deploy | rollback | status | logs | backup | restore | test | ca-cert)
       "cmd_$command" "$@" ;;
     -h | --help | help) usage ;;
     *) die "unknown command: $command (see $0 --help)" ;;

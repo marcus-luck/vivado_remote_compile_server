@@ -96,9 +96,11 @@ unless a step says otherwise.
    `https://buildserver.drystone.solutions/auth/callback` as an authorised
    redirect URI.
 
-5. **Cloudflare token.** Cloudflare dashboard > My Profile > API Tokens >
-   Create Token, template *Edit zone DNS*, zone `drystone.solutions`. Caddy
-   uses it for the certificate (see "HTTPS on the local network").
+5. **Certificate.** If the zone is on Cloudflare: Cloudflare dashboard >
+   My Profile > API Tokens > Create Token, template *Edit zone DNS*, that
+   zone. Otherwise set `CADDY_TLS=internal` in `deploy/caddy.env` and install
+   Caddy's root certificate on the clients after the deploy. See "HTTPS on
+   the local network".
 
 6. **DNS.** On the local DNS server, point `buildserver.drystone.solutions`
    at the server's LAN address.
@@ -111,7 +113,7 @@ unless a step says otherwise.
    | `.env` | `BUILDSERVER_GOOGLE_CLIENT_ID`, `BUILDSERVER_GOOGLE_CLIENT_SECRET` (step 4) |
    | `.env` | `BUILDSERVER_ADMIN_EMAILS`: your Google account |
    | `.env` | `BUILDSERVER_VIVADO`: set by `provision` if Vivado was installed first, else e.g. `/opt/Xilinx/2025.2/Vivado/bin/vivado` |
-   | `deploy/caddy.env` | `CLOUDFLARE_API_TOKEN` (step 5) |
+   | `deploy/caddy.env` | `CLOUDFLARE_API_TOKEN` (step 5), or `CADDY_TLS=internal` |
 
    Optional: GitHub repository builds (`BUILDSERVER_GITHUB_CLIENT_ID`,
    `BUILDSERVER_GITHUB_CLIENT_SECRET`, see "Repositories and GitHub").
@@ -229,22 +231,37 @@ sign in, serve the server under a host name over HTTPS and set
 
 ### HTTPS on the local network
 
-The `caddy` container is the HTTPS endpoint for
-`buildserver.drystone.solutions`, a name the local DNS server resolves to the
-build host (`deploy/Caddyfile`). The name is not reachable from the internet,
-so Caddy gets its Let's Encrypt certificate through a DNS challenge on
-Cloudflare, which hosts the `drystone.solutions` zone. Its image
-(`deploy/caddy/Dockerfile`) is Caddy built with the Cloudflare DNS module.
+The `caddy` container is the HTTPS endpoint for the host name in
+`BUILDSERVER_PUBLIC_URL` (e.g. `https://buildserver.drystone.solutions`), a
+name the local DNS server resolves to the build host (`deploy/Caddyfile`).
+Use a name under a public domain even though it resolves only locally:
+Google refuses redirect URIs on `.local` and other private names.
 
-1. Create a Cloudflare API token from the *Edit zone DNS* template for the
-   `drystone.solutions` zone, and put it in `deploy/caddy.env`. It stays out
-   of `.env`, which the api and worker containers get.
-2. Add `https://buildserver.drystone.solutions/auth/callback` to the OAuth
-   client's authorised redirect URIs in Google Cloud.
-3. In `.env`, set `BUILDSERVER_PUBLIC_URL=https://buildserver.drystone.solutions`.
-4. Allow inbound TCP 443 (and 80, for the redirect) in the host's firewall.
+`CADDY_TLS` in `deploy/caddy.env` picks the certificate:
 
-Caddy renews the certificate by itself.
+- **`cloudflare`** (default): Let's Encrypt, through a DNS challenge on
+  Cloudflare, which must host the name's zone. The name is not reachable from
+  the internet, so this is the only way Let's Encrypt can check it. Create a
+  Cloudflare API token from the *Edit zone DNS* template for the zone and put
+  it in `CLOUDFLARE_API_TOKEN`. The image (`deploy/caddy/Dockerfile`) is Caddy
+  built with the Cloudflare DNS module.
+- **`internal`**: Caddy's own certificate authority, for a zone that isn't on
+  Cloudflare. Nothing is needed outside the server, but browsers warn until
+  each client trusts Caddy's root certificate. `deploy/buildserverctl ca-cert
+  > buildserver-ca.crt` prints it after the first deploy; on Windows, install
+  it with `certutil -addstore -f Root buildserver-ca.crt` (admin) or by
+  double-clicking it, store *Trusted Root Certification Authorities*. The
+  root is valid for 10 years and lives in the `caddy_data` volume: keep that
+  volume, or every client must trust a new one.
+
+Both ways:
+
+1. Add `<BUILDSERVER_PUBLIC_URL>/auth/callback` to the OAuth client's
+   authorised redirect URIs in Google Cloud.
+2. Allow inbound TCP 443 (and 80, for the redirect) in the host's firewall.
+
+Caddy renews the certificate by itself. The secrets in `deploy/caddy.env`
+stay out of `.env`, which the api and worker containers get.
 
 Who may sign in:
 

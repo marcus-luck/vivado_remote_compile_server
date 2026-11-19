@@ -1,19 +1,34 @@
 # HTTPS front for the build server on the local network.
 #
-# Caddy terminates TLS and forwards to the api container on port 8000. The host name
-# resolves to a private address, so Let's Encrypt cannot reach it; the
-# certificate is obtained with a DNS challenge through Cloudflare instead.
+# Caddy terminates TLS and forwards to the api container on port 8000. The
+# site is BUILDSERVER_PUBLIC_URL from .env (compose.yaml passes it in).
+#
+# CADDY_TLS in caddy.env picks the certificate:
+#   cloudflare (default)  Let's Encrypt with a DNS challenge through
+#                         Cloudflare, CLOUDFLARE_API_TOKEN in caddy.env. The
+#                         host name resolves to a private address, so Let's
+#                         Encrypt cannot reach the server itself.
+#   internal              Caddy's own CA. Browsers trust it only after its
+#                         root certificate is installed on each client
+#                         (deploy/buildserverctl ca-cert prints it).
 #
 # Runs in the caddy container of compose.yaml, a Caddy build with the
-# Cloudflare DNS module (deploy/caddy/Dockerfile), with CLOUDFLARE_API_TOKEN
-# from caddy.env (see caddy.env.template).
+# Cloudflare DNS module (deploy/caddy/Dockerfile).
 
-buildserver.drystone.solutions {
+(tls-cloudflare) {
 	tls {
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 		# Check the challenge record against public DNS: the local DNS server
 		# answers for this name itself and may not see the TXT record.
 		resolvers 1.1.1.1
 	}
+}
+
+(tls-internal) {
+	tls internal
+}
+
+{$BUILDSERVER_PUBLIC_URL} {
+	import tls-{$CADDY_TLS:cloudflare}
 	reverse_proxy api:8000
 }

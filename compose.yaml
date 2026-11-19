@@ -17,6 +17,9 @@ services:
       - "80:80"
       - "443:443"
     env_file: deploy/caddy.env
+    environment:
+      # The site address in the Caddyfile; compose reads it from .env.
+      BUILDSERVER_PUBLIC_URL: ${BUILDSERVER_PUBLIC_URL:?set BUILDSERVER_PUBLIC_URL in .env}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

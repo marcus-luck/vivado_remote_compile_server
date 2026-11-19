@@ -19,7 +19,7 @@ Two processes (the `api` and `worker` containers) sharing one `.env` and one dat
 - `buildserver/db.py`: SQLite `builds` table, which is also the task queue (oldest `queued` row is claimed), `users`, `api_tokens`, `github_links` and `repos` tables.
 - `buildserver/storage.py`: on-disk layout and zip handling.
 - `buildserver/admin.py`: `python -m buildserver.admin busy|backup|restore`, run inside the containers by `deploy/buildserverctl`; backup and restore take `-` to stream the database through stdout/stdin.
-- `deploy/buildserverctl`: bash, on the host, from its git checkout (e.g. `/opt/buildserver`). `provision` (sudo: Docker, `.env` with generated secrets, `/var/backups/buildserver`, the `deploy/buildserver-backup.*` systemd timer), `deploy [ref]` (refuses while a build runs, backup, checkout, `test`, `compose up`, waits for `/healthz`, rolls back on failure, appends to git-ignored `.deploy-history`), `rollback`, `status`, `logs`, `backup`, `restore`, `test`. Its body is only functions plus a last `main "$@"; exit` line, so a checkout can replace the file mid-deploy.
+- `deploy/buildserverctl`: bash, on the host, from its git checkout (e.g. `/opt/buildserver`). `provision` (sudo: Docker, `.env` with generated secrets, `/var/backups/buildserver`, the `deploy/buildserver-backup.*` systemd timer), `deploy [ref]` (refuses while a build runs, backup, checkout, `test`, `compose up`, waits for `/healthz`, rolls back on failure, appends to git-ignored `.deploy-history`), `rollback`, `status`, `logs`, `backup`, `restore`, `test`, `ca-cert`. Its body is only functions plus a last `main "$@"; exit` line, so a checkout can replace the file mid-deploy.
 - `buildserver/config.py`: settings from `BUILDSERVER_*` variables in `.env` (see `.env.template`); the real environment overrides the file. No paths are hardcoded in the code: every path setting is required and comes from `.env`.
 - `buildserver/templates/`: htmx front end. `index.html` is the page; the `_*.html` fragments are what `/ui/...` returns for htmx to swap in. No build step.
 - `buildserver/static/`: stylesheet, vendored htmx, a few lines of JS.
@@ -41,9 +41,11 @@ before finishing a change.
 ## Commands
 
 Deployed on a Linux host with Docker (`compose.yaml`, `Dockerfile`): `caddy`
-(`deploy/caddy/Dockerfile`, Cloudflare DNS challenge, token in git-ignored
-`deploy/caddy.env`) serves `https://buildserver.drystone.solutions` (local DNS
-only) and proxies to `api:8000`; `worker` mounts the host's Linux Vivado at
+(`deploy/caddy/Dockerfile`) serves the host of `BUILDSERVER_PUBLIC_URL`
+(e.g. `https://buildserver.drystone.solutions`, local DNS only) with a
+Let's Encrypt certificate through a Cloudflare DNS challenge or, with
+`CADDY_TLS=internal` in git-ignored `deploy/caddy.env`, Caddy's own CA
+(`buildserverctl ca-cert` prints its root), and proxies to `api:8000`; `worker` mounts the host's Linux Vivado at
 `/opt/Xilinx` read-only and runs builds as `builder` (`deploy/sudoers`). Both
 share the `data` volume (0700, user `app`). Google sign-in needs HTTPS, so
 don't publish the api port.
