@@ -15,127 +15,262 @@ a worker builds it, and the build artifacts are offered back as a zip.
 
 The server runs on a Linux host as three containers (`compose.yaml`):
 
-- `caddy`: HTTPS on ports 80 and 443 (see "HTTPS on the local network").
-- `api`: the API and front end, reachable only from Caddy.
+- `caddy`: HTTPS on ports 80 and 443. See "HTTPS on the local network".
+- `api`: the API and the front end. Only Caddy can reach it.
 - `worker`: runs the builds, one at a time.
 
-The database, packages, logs and artifacts live in the `data` volume. Vivado
-is not in any image: the host's Linux install is mounted read-only into the
-worker at `/opt/Xilinx`.
+The `data` volume holds the database, packages, logs and artifacts. The
+images do not contain Vivado. The worker mounts the host's Linux Vivado
+install read-only at `/opt/Xilinx`.
 
-`deploy/buildserverctl` sets up the host and deploys, from a git checkout of
-this repository on the host. It runs as a deploy account in group `docker`;
-only `provision` needs sudo.
+`deploy/buildserverctl` sets up the host and deploys. It runs from a git
+checkout of this repository on the host, as a deploy account in group
+`docker`. Only `provision` needs sudo.
 
 ### New server, step by step
 
-Run the commands on the server, as the account that will deploy (not root),
-unless a step says otherwise.
+Do the steps in sequence. Run the commands on the server, as the deploy
+account (not root), unless the step tells you differently. In the commands,
+`<host>` is the host name of the server, e.g.
+`buildserver.drystone.solutions`.
 
-1. **Machine.** Ubuntu Server (any recent release: the containers are Ubuntu
-   22.04, which Vivado supports) with the OpenSSH server. At least 8 cores,
-   16 GB RAM and 150 GB disk; Vivado alone takes 17 GB for Artix-7.
-   - The Ubuntu installer gives the root volume only part of the disk. Grow
-     it: `sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv`.
-   - Hyper-V: a Generation 2 VM boots Ubuntu only with the Secure Boot
-     template *Microsoft UEFI Certificate Authority*. Use static memory and
-     turn automatic checkpoints off. The *Default Switch* is reachable only
-     from the Hyper-V host and changes address on reboots; use an *External*
-     switch for a fixed LAN address.
-   - VirtualBox on a Windows host with Hyper-V enabled (Docker Desktop, WSL2)
-     runs on top of Hyper-V and freezes under load: use Hyper-V instead.
-     Bridged over Wi-Fi it is also slow; add a NAT adapter for internet
-     traffic.
+#### 1. Prepare the machine
 
-2. **Checkout and provision.**
+1. Install Ubuntu Server (any recent release) with the OpenSSH server.
+   - Minimum: 8 cores, 16 GB RAM, 150 GB disk. Vivado for Artix-7 uses
+     17 GB.
+   - The containers use Ubuntu 22.04, which Vivado supports.
+2. Give the root volume all of the disk. The Ubuntu installer uses only
+   part of it:
 
    ```
-   sudo apt-get install -y git curl
-   sudo git clone https://github.com/marcus-luck/vivado_remote_compile_server.git /opt/buildserver
-   sudo chown -R "$USER": /opt/buildserver
-   sudo /opt/buildserver/deploy/buildserverctl provision
+   sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
    ```
 
-   `provision` installs Docker and adds you to group `docker` (log in again
-   afterwards), creates `.env` with a new session secret and token key and
-   `deploy/caddy.env`, creates `/var/backups/buildserver` with a nightly
-   backup timer, and lists the settings still empty. Running it again changes
-   nothing that is set up.
+3. Make sure that the deploy account has a home directory. If it does not,
+   make one:
 
-3. **Vivado.** Download the Linux *Unified Installer* (web installer, `.bin`)
-   from AMD and copy it to the server. Then:
+   ```
+   sudo mkdir -p /home/<account>
+   sudo cp -r /etc/skel/. /home/<account>/
+   sudo chown -R <account>: /home/<account>
+   ```
+
+4. Give the machine a fixed LAN address, e.g. with a DHCP reservation.
+
+On a Hyper-V host:
+
+- Use a Generation 2 VM with the Secure Boot template *Microsoft UEFI
+  Certificate Authority*. Ubuntu does not boot with the default template.
+- Use static memory. Turn automatic checkpoints off.
+- Connect the VM to an *External* switch on a wired adapter. Only the
+  Hyper-V host can reach the *Default Switch*, and its address changes when
+  the host restarts.
+
+> **CAUTION:** Do not use VirtualBox on a Windows host with Hyper-V enabled
+> (Docker Desktop or WSL2 enable it). VirtualBox then runs on top of
+> Hyper-V and freezes under load. Use Hyper-V.
+
+#### 2. Get the code
+
+```
+sudo apt-get install -y git curl
+sudo git clone https://github.com/marcus-luck/vivado_remote_compile_server.git /opt/buildserver
+sudo chown -R "$USER": /opt/buildserver
+```
+
+#### 3. Install Vivado
+
+1. Download the Linux *Unified Installer* (web installer, `.bin`) from AMD.
+   Copy it to the home directory on the server.
+2. Extract the installer and make the install directory:
 
    ```
    sudo install -d -o "$USER" -g "$USER" /opt/Xilinx
    chmod +x FPGAs_AdaptiveSoCs_Unified_*_Lin64.bin
    ./FPGAs_AdaptiveSoCs_Unified_*_Lin64.bin --noexec --keep --target ~/xinstall
+   ```
+
+3. Make the install configuration. Select 2 (Vivado), then 1 (ML Standard):
+
+   ```
    cd ~/xinstall
-   ./xsetup -b ConfigGen          # choose 2 (Vivado), then 1 (ML Standard)
+   ./xsetup -b ConfigGen
    ```
 
-   Edit `~/.Xilinx/install_config.txt`: `Destination=/opt/Xilinx`, set the
-   device families you build for to `:1` (e.g. `Artix-7 FPGAs:1`) and the
-   rest, DocNav and Model Composer included, to `:0`. Then sign in to AMD and
-   install:
+   To install the same devices as an existing server, copy its
+   `~/.Xilinx/install_config.txt` instead.
+4. Edit `~/.Xilinx/install_config.txt`:
+   - Set `Destination=/opt/Xilinx`.
+   - Set the device families that you build for to `:1`, e.g.
+     `Artix-7 FPGAs:1`.
+   - Set all other entries to `:0`, DocNav and Model Composer included.
+5. Sign in to AMD with your AMD account:
+
+   > **CAUTION:** Do not use sudo for this command. With sudo, the token
+   > goes to `/root/.Xilinx` and the install cannot find it.
 
    ```
-   ./xsetup -b AuthTokenGen       # your AMD account; not with sudo
+   ./xsetup -b AuthTokenGen
+   ```
+
+   The token is valid for approximately one week.
+6. Start the install. It downloads approximately 17 GB:
+
+   ```
    _JAVA_OPTIONS=-Djava.net.preferIPv4Stack=true \
      ./xsetup -b Install -a XilinxEULA,3rdPartyEULA -c ~/.Xilinx/install_config.txt
    ```
 
-   The token lasts about a week. A failed download leaves a broken partial
-   file: delete `/opt/Xilinx/Downloads` before trying again. ML Standard needs
-   no licence. Install Vivado before step 2's `provision`, or set
-   `BUILDSERVER_VIVADO` by hand (step 7). Vivado may not start on the host
-   itself (missing locale and libraries); that is fine, builds run it in the
-   worker container.
-
-4. **Google sign-in.** In the Google Cloud console, APIs & Services >
-   Credentials, create an OAuth client ID of type *Web application*, with
-   `https://buildserver.drystone.solutions/auth/callback` as an authorised
-   redirect URI.
-
-5. **Certificate.** If the zone is on Cloudflare: Cloudflare dashboard >
-   My Profile > API Tokens > Create Token, template *Edit zone DNS*, that
-   zone. Otherwise set `CADDY_TLS=internal` in `deploy/caddy.env` and install
-   Caddy's root certificate on the clients after the deploy. See "HTTPS on
-   the local network".
-
-6. **DNS.** On the local DNS server, point `buildserver.drystone.solutions`
-   at the server's LAN address.
-
-7. **Settings.** Fill in what `provision` listed:
-
-   | File | Setting |
-   | --- | --- |
-   | `.env` | `BUILDSERVER_PUBLIC_URL=https://buildserver.drystone.solutions` |
-   | `.env` | `BUILDSERVER_GOOGLE_CLIENT_ID`, `BUILDSERVER_GOOGLE_CLIENT_SECRET` (step 4) |
-   | `.env` | `BUILDSERVER_ADMIN_EMAILS`: your Google account |
-   | `.env` | `BUILDSERVER_VIVADO`: set by `provision` if Vivado was installed first, else e.g. `/opt/Xilinx/2025.2/Vivado/bin/vivado` |
-   | `deploy/caddy.env` | `CLOUDFLARE_API_TOKEN` (step 5), or `CADDY_TLS=internal` |
-
-   Optional: GitHub repository builds (`BUILDSERVER_GITHUB_CLIENT_ID`,
-   `BUILDSERVER_GITHUB_CLIENT_SECRET`, see "Repositories and GitHub").
-   Keep a copy of `BUILDSERVER_TOKEN_KEY` somewhere safe.
-
-8. **Deploy.**
+7. Make sure that the install is complete:
 
    ```
-   cd /opt/buildserver
-   deploy/buildserverctl deploy        # or a branch, e.g. deploy my-branch
-   deploy/buildserverctl status
+   ls /opt/Xilinx/*/Vivado/bin/vivado
    ```
 
-   The first deploy builds the images and runs the tests: allow about
-   15 minutes. `status` shows `api: healthy` when it is up.
+If the download fails:
 
-9. **Check.** Open `https://buildserver.drystone.solutions` and sign in with
-   the admin account. The first certificate takes a minute;
-   `deploy/buildserverctl logs caddy` shows its progress ("certificate
-   obtained successfully"). Queue a small build to check Vivado. Before DNS
-   is in place, test from another machine with
-   `curl --resolve buildserver.drystone.solutions:443:<server-ip> https://buildserver.drystone.solutions/healthz`.
+1. Make sure that the install did not complete (step 7). A second install
+   of the same version fails.
+2. Delete `/opt/Xilinx/Downloads`. A failed download leaves a broken
+   partial file there.
+3. Do step 6 again.
+
+ML Standard needs no licence. Vivado possibly does not start on the host
+itself, because the host does not have its locale and libraries. This is
+correct: the builds run Vivado in the worker container.
+
+#### 4. Provision the host
+
+```
+sudo /opt/buildserver/deploy/buildserverctl provision
+```
+
+`provision` does these tasks:
+
+- It installs Docker and adds you to group `docker`. Log out and log in
+  again after the first run.
+- It makes `.env` with a new session secret and token key, and
+  `deploy/caddy.env`.
+- It finds Vivado under `/opt/Xilinx` and sets `BUILDSERVER_VIVADO`.
+- It makes `/var/backups/buildserver` and a nightly backup timer.
+- It lists the settings that are empty.
+
+You can run `provision` again at any time. It does not change what is set
+up. If you installed Vivado after `provision`, run `provision` again to set
+`BUILDSERVER_VIVADO`.
+
+#### 5. Select the host name
+
+> **CAUTION:** Do not use a `.local` name or other private name. Google
+> refuses redirect URIs on these names, and Let's Encrypt does not issue
+> certificates for them.
+
+Use a name in a public domain, e.g. `buildserver.drystone.solutions`. The
+name must resolve only on the local network.
+
+#### 6. Make the Google sign-in client
+
+1. In the Google Cloud console, go to APIs & Services > Credentials.
+2. Make an OAuth client ID of type *Web application*. You can also use the
+   client of an existing server.
+3. Add `https://<host>/auth/callback` as an authorised redirect URI.
+4. Make sure that the OAuth consent screen accepts the admin accounts:
+   - *Testing*: add each account as a test user.
+   - *Internal*: only accounts of the project's own organisation can sign
+     in.
+
+#### 7. Select the certificate
+
+Do one of the two procedures. See "HTTPS on the local network".
+
+- **The domain is on Cloudflare:** In the Cloudflare dashboard, go to My
+  Profile > API Tokens > Create Token. Use the template *Edit zone DNS* for
+  the zone of the host name. Put the token in `CLOUDFLARE_API_TOKEN` in
+  `deploy/caddy.env`.
+- **The domain is not on Cloudflare:** Set `CADDY_TLS=internal` in
+  `deploy/caddy.env`. After the deploy, install the root certificate on the
+  clients (step 11).
+
+#### 8. Add the DNS record
+
+On the local DNS server, point the host name to the LAN address of the
+server.
+
+#### 9. Fill in the settings
+
+Fill in the settings that `provision` listed:
+
+| File | Setting |
+| --- | --- |
+| `.env` | `BUILDSERVER_PUBLIC_URL=https://<host>` |
+| `.env` | `BUILDSERVER_GOOGLE_CLIENT_ID`, `BUILDSERVER_GOOGLE_CLIENT_SECRET` (step 6) |
+| `.env` | `BUILDSERVER_ADMIN_EMAILS`: the admin Google accounts, separated by commas |
+| `.env` | `BUILDSERVER_VIVADO`: `provision` sets it (e.g. `/opt/Xilinx/2025.2/Vivado/bin/vivado`) |
+| `deploy/caddy.env` | `CLOUDFLARE_API_TOKEN`, or `CADDY_TLS=internal` (step 7) |
+
+Optional: GitHub repository builds (`BUILDSERVER_GITHUB_CLIENT_ID`,
+`BUILDSERVER_GITHUB_CLIENT_SECRET`). See "Repositories and GitHub".
+
+> **WARNING:** Keep a copy of `BUILDSERVER_TOKEN_KEY` in a safe location.
+> Without it, the server cannot read the stored GitHub tokens.
+
+#### 10. Deploy
+
+```
+cd /opt/buildserver
+deploy/buildserverctl deploy
+deploy/buildserverctl status
+```
+
+`deploy` deploys `main`. To deploy a branch, add its name, e.g.
+`deploy/buildserverctl deploy my-branch`.
+
+The first deploy builds the images and runs the tests. It takes
+approximately 15 minutes. When the server is ready, `status` shows
+`api: healthy`.
+
+#### 11. Install the root certificate (CADDY_TLS=internal only)
+
+Do this step on each client that uses the server.
+
+> **CAUTION:** Do not delete the `caddy_data` volume. It holds the root
+> certificate. If you delete it, Caddy makes a new root certificate, and
+> you must install it on all the clients again.
+
+1. On the server, write the root certificate to a file:
+
+   ```
+   deploy/buildserverctl ca-cert > buildserver-ca.crt
+   ```
+
+2. Copy the file to the client.
+3. Install the certificate in the store *Trusted Root Certification
+   Authorities*:
+   - Windows: double-click the file and select Install Certificate > Local
+     Machine. Or, as administrator:
+     `certutil -addstore -f Root buildserver-ca.crt`.
+   - Linux and macOS: add the file to the system trust store. Firefox uses
+     its own store.
+4. Restart the browser.
+
+The root certificate is valid for 10 years.
+
+#### 12. Do a check
+
+1. Open `https://<host>` and sign in with an admin account.
+2. With `CADDY_TLS=cloudflare`, the first certificate takes approximately
+   one minute. To see the progress, run `deploy/buildserverctl logs caddy`.
+   Find "certificate obtained successfully".
+3. Queue a small build to make sure that Vivado runs.
+
+Before the DNS record is available, do a check from a different machine:
+
+```
+curl --resolve <host>:443:<server-ip> https://<host>/healthz
+```
+
+The correct response is `{"status":"ok"}`.
 
 ### Deploying
 
@@ -147,30 +282,42 @@ deploy/buildserverctl logs worker
 deploy/buildserverctl rollback
 ```
 
-A deploy:
-1. refuses while a build is running (`--force` fails that build);
-2. takes a backup;
-3. checks out the ref and runs the tests in the worker image, sandbox tests
-   included; if they fail, nothing changes;
-4. rebuilds and restarts the containers, then waits for the api's
-   `/healthz`. If the new version is not healthy within two minutes, it goes
-   back to the previous one.
+A deploy does these steps:
 
-`.deploy-history` records each deploy; `rollback` deploys the one before
-the current, without the tests. Run a single worker: builds are serialised
-on purpose (Vivado is CPU and memory bound).
+1. It stops if a build runs. With `--force`, it continues and the running
+   build fails.
+2. It makes a backup.
+3. It checks out the ref and runs the tests in the worker image, sandbox
+   tests included. If a test fails, the deploy stops and nothing changes.
+4. It builds and restarts the containers. Then it waits for the api's
+   `/healthz`. If the new version is not healthy in two minutes, the deploy
+   goes back to the previous version.
+
+`.deploy-history` records each deploy. `rollback` deploys the version before
+the current one, without the tests.
+
+Run only one worker. The worker runs one build at a time, because Vivado
+uses much CPU and memory.
 
 ### Backups
 
 `deploy/buildserverctl backup` copies the live database and `.env` to
-`/var/backups/buildserver` and keeps the newest 14 of each; the timer runs it
-every night, and every deploy runs it too. `.env` goes with the database
-because without its `BUILDSERVER_TOKEN_KEY` the stored GitHub tokens cannot
-be read. Copy the directory off the host as well.
+`/var/backups/buildserver`. It keeps the newest 14 copies of each. The timer
+runs it each night, and each deploy runs it too.
 
-`deploy/buildserverctl restore /var/backups/buildserver/builds-<date>.db`
-backs up the current database, stops the api and the worker, checks the file
-and puts it in place. Packages, logs and artifacts are not in the backup.
+The backup includes `.env` because the database needs its
+`BUILDSERVER_TOKEN_KEY`. Without the key, the server cannot read the stored
+GitHub tokens. Copy the backup directory to a different machine too.
+
+To restore a backup:
+
+```
+deploy/buildserverctl restore /var/backups/buildserver/builds-<date>.db
+```
+
+`restore` makes a backup of the current database first. Then it stops the
+api and the worker, does a check of the file and puts it in position.
+Packages, logs and artifacts are not in the backup.
 
 ### Build isolation
 
@@ -231,37 +378,39 @@ sign in, serve the server under a host name over HTTPS and set
 
 ### HTTPS on the local network
 
-The `caddy` container is the HTTPS endpoint for the host name in
-`BUILDSERVER_PUBLIC_URL` (e.g. `https://buildserver.drystone.solutions`), a
-name the local DNS server resolves to the build host (`deploy/Caddyfile`).
-Use a name under a public domain even though it resolves only locally:
-Google refuses redirect URIs on `.local` and other private names.
+The `caddy` container is the HTTPS endpoint (`deploy/Caddyfile`). It uses
+the host name in `BUILDSERVER_PUBLIC_URL`, e.g.
+`https://buildserver.drystone.solutions`. The local DNS server resolves this
+name to the build host.
 
-`CADDY_TLS` in `deploy/caddy.env` picks the certificate:
+> **CAUTION:** Use a name in a public domain, also if it resolves only on
+> the local network. Google refuses redirect URIs on `.local` and other
+> private names.
 
-- **`cloudflare`** (default): Let's Encrypt, through a DNS challenge on
-  Cloudflare, which must host the name's zone. The name is not reachable from
-  the internet, so this is the only way Let's Encrypt can check it. Create a
-  Cloudflare API token from the *Edit zone DNS* template for the zone and put
-  it in `CLOUDFLARE_API_TOKEN`. The image (`deploy/caddy/Dockerfile`) is Caddy
-  built with the Cloudflare DNS module.
-- **`internal`**: Caddy's own certificate authority, for a zone that isn't on
-  Cloudflare. Nothing is needed outside the server, but browsers warn until
-  each client trusts Caddy's root certificate. `deploy/buildserverctl ca-cert
-  > buildserver-ca.crt` prints it after the first deploy; on Windows, install
-  it with `certutil -addstore -f Root buildserver-ca.crt` (admin) or by
-  double-clicking it, store *Trusted Root Certification Authorities*. The
-  root is valid for 10 years and lives in the `caddy_data` volume: keep that
-  volume, or every client must trust a new one.
+`CADDY_TLS` in `deploy/caddy.env` selects the certificate:
 
-Both ways:
+- **`cloudflare`** (default): a Let's Encrypt certificate, through a DNS
+  challenge on Cloudflare. Cloudflare must hold the zone of the host name.
+  The internet cannot reach the host, so Let's Encrypt cannot use a
+  different challenge. Make a Cloudflare API token with the template
+  *Edit zone DNS* for the zone. Put it in `CLOUDFLARE_API_TOKEN`. The image
+  (`deploy/caddy/Dockerfile`) is Caddy with the Cloudflare DNS module.
+- **`internal`**: a certificate from Caddy's own certificate authority. Use
+  it when the zone is not on Cloudflare. The server needs nothing from
+  outside. Browsers show a warning until the client trusts Caddy's root
+  certificate. To install the root certificate, see step 11 of "New server,
+  step by step".
 
-1. Add `<BUILDSERVER_PUBLIC_URL>/auth/callback` to the OAuth client's
-   authorised redirect URIs in Google Cloud.
-2. Allow inbound TCP 443 (and 80, for the redirect) in the host's firewall.
+For the two types:
 
-Caddy renews the certificate by itself. The secrets in `deploy/caddy.env`
-stay out of `.env`, which the api and worker containers get.
+1. Add `<BUILDSERVER_PUBLIC_URL>/auth/callback` to the authorised redirect
+   URIs of the OAuth client in Google Cloud.
+2. Open inbound TCP 443 in the firewall of the host. Also open TCP 80, for
+   the redirect to HTTPS.
+
+Caddy renews the certificate automatically. The secrets in
+`deploy/caddy.env` are not in `.env`, because the api and worker containers
+get `.env`.
 
 Who may sign in:
 

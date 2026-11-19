@@ -188,7 +188,11 @@ cmd_provision() {
     install -m 600 -o "$user" -g "$user" "$ROOT/.env.template" "$ROOT/.env"
     set_env_value BUILDSERVER_SESSION_SECRET "$(random_secret)" "$ROOT/.env"
     set_env_value BUILDSERVER_TOKEN_KEY "$(random_fernet_key)" "$ROOT/.env"
-    [[ -n "$vivado" ]] && set_env_value BUILDSERVER_VIVADO "$vivado" "$ROOT/.env"
+  fi
+  # Also on a later run, once Vivado is installed; a set path is kept.
+  if [[ -n "$vivado" && -z "$(env_value BUILDSERVER_VIVADO "$ROOT/.env")" ]]; then
+    log "setting BUILDSERVER_VIVADO=$vivado"
+    set_env_value BUILDSERVER_VIVADO "$vivado" "$ROOT/.env"
   fi
   if [[ ! -f "$ROOT/deploy/caddy.env" ]]; then
     log "creating deploy/caddy.env"
