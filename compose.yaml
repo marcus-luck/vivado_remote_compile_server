@@ -42,7 +42,7 @@ services:
       - data:/data
     security_opt:
       - no-new-privileges:true
-    # deploy/buildserverctl waits for this before it calls a deploy good.
+    # deploy/buildserverctl uses healthz to check if a deploy is succesful.
     healthcheck:
       test:
         - CMD
@@ -54,7 +54,6 @@ services:
       start_period: 30s
       start_interval: 2s
       retries: 3
-    # No published port: only Caddy reaches it, on the compose network.
 
   worker:
     build:
@@ -70,18 +69,13 @@ services:
       - data:/data
       - work:/work
       - ${VIVADO_DIR:-/opt/Xilinx}:/opt/Xilinx:ro
-    # A running build is failed when the worker restarts; give it time to
-    # be killed cleanly.
+    # If a workers restarts a running build fails, need time to be destroyed.
     stop_grace_period: 30s
-    # An init process reaps the build processes the worker kills.
     init: true
-    # sudo, which runs builds as builder, needs setuid: no
-    # no-new-privileges here. Uncomment to cap what a build can take:
+    # Uncomment to cap what a build can take:
     # mem_limit: 48g
     # cpus: 12
 
-# Named volumes, not bind mounts: SQLite's locking between the api and
-# worker containers is reliable on them.
 volumes:
   data:
   work:
