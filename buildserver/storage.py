@@ -6,12 +6,22 @@ Layout:
     <data_dir>/builds/<id>/package.zip    uploaded build package
     <data_dir>/builds/<id>/build.log      build output
     <data_dir>/builds/<id>/artifacts.zip  build artifacts
-    <data_dir>/work/<id>/                 extracted package, removed after the
-                                          build
+    <work_root>/<id>/                     extracted package or clone, removed
+                                          after the build
+    <work_root>/<id>.home/                home of a sandboxed build, removed
+                                          after the build
+
+<work_root> is <data_dir>/work unless BUILDSERVER_WORK_DIR moves it.
+
+The retention pass of the worker deletes the package and artifacts of old
+builds; their logs stay. It also deletes build directories whose build
+record is gone, which a failed delete can leave behind.
 """
 
 import os
 import pathlib
+import shutil
+import stat
 import zipfile
 
 
@@ -24,15 +34,20 @@ class Storage:
         work_root: Directory holding the work directory of the running build.
     """
 
-    def __init__(self, data_dir: pathlib.Path) -> None:
+    def __init__(
+        self, data_dir: pathlib.Path, work_root: pathlib.Path | None = None
+    ) -> None:
         """Creates the directory layout if it is missing.
 
         Args:
             data_dir: Root of the data directory.
+            work_root: Directory for the work directories, or None for
+                data_dir/work. Kept apart from data_dir when builds run as
+                another account, which must not see data_dir.
         """
         self.data_dir = data_dir
         self.builds_dir = data_dir / "builds"
-        self.work_root = data_dir / "work"
+        self.work_root = work_root or data_dir / "work"
         self.builds_dir.mkdir(parents=True, exist_ok=True)
         self.work_root.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +75,46 @@ class Storage:
     def work_dir(self, build_id: str) -> pathlib.Path:
         """Returns the directory a build's package is extracted to."""
         return self.work_root / build_id
+
+    def home_dir(self, build_id: str) -> pathlib.Path:
+        """Returns the fresh home directory a sandboxed build runs with.
+
+        It lies next to the work directory, not inside it, so it does not
+        disturb the search for the build script.
+        """
+        return self.work_root / f"{build_id}.home"
+
+    def expire_files(self, build_id: str) -> None:
+        """Deletes the package and artifacts of a build, keeping its log.
+
+        Args:
+            build_id: Id of the build.
+
+        Raises:
+            OSError: If a file cannot be deleted, for example because a
+                download holds it open on Windows.
+        """
+        self.package_path(build_id).unlink(missing_ok=True)
+        self.artifacts_path(build_id).unlink(missing_ok=True)
+
+    def delete_build_dir(self, build_id: str) -> None:
+        """Deletes all files of a build.
+
+        Args:
+            build_id: Id of the build.
+
+        Raises:
+            OSError: If a file cannot be deleted, for example because a
+                download holds it open on Windows. The files that could be
+                deleted are gone.
+        """
+        build_dir = self.build_dir(build_id)
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+
+    def build_dirs(self) -> list[pathlib.Path]:
+        """Lists the build directories, one per build id."""
+        return [path for path in self.builds_dir.iterdir() if path.is_dir()]
 
 
 def extract_package(zip_path: pathlib.Path, dest: pathlib.Path) -> None:
@@ -107,6 +162,28 @@ def find_build_root(
     return None
 
 
+def regular_files(src: pathlib.Path) -> list[pathlib.Path]:
+    """Lists the regular files under a directory.
+
+    Symbolic links are skipped, to files and to directories alike, and so
+    are FIFOs, sockets and devices. A build cannot use them to put a file
+    it cannot read itself into its artifacts.
+
+    Args:
+        src: The directory. It must not be a symbolic link itself.
+
+    Returns:
+        The files, sorted.
+    """
+    files = []
+    for dirpath, _, filenames in os.walk(src, followlinks=False):
+        for filename in filenames:
+            path = pathlib.Path(dirpath) / filename
+            if stat.S_ISREG(path.lstat().st_mode):
+                files.append(path)
+    return sorted(files)
+
+
 def zip_dir(
     src: pathlib.Path,
     zip_path: pathlib.Path,
@@ -119,15 +196,15 @@ def zip_dir(
 
     Args:
         src: Directory whose contents go at the top level of the archive.
+            Only its regular files are zipped (see regular_files).
         zip_path: The archive to write. Replaced if it exists.
         extra: Additional files to add, as archive name to file path.
     """
     tmp_path = zip_path.with_name(zip_path.name + ".tmp")
     with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as archive:
         if src.is_dir():
-            for path in sorted(src.rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(src).as_posix())
+            for path in regular_files(src):
+                archive.write(path, path.relative_to(src).as_posix())
         for arcname, path in (extra or {}).items():
             archive.write(path, arcname)
     os.replace(tmp_path, zip_path)

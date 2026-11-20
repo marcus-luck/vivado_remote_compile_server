@@ -1,0 +1,8 @@
+# Installed as /etc/sudoers.d/buildserver in the worker image.
+#
+# The worker (app) runs build commands as builder, and may do nothing else
+# through sudo. builder cannot read the data directory or the worker's
+# environment; see buildserver/sandbox.py.
+
+Defaults:app !use_pty, !lecture, !requiretty, env_reset
+app ALL=(builder) NOPASSWD: ALL

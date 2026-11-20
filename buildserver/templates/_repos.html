@@ -1,0 +1,101 @@
+<section id="repos">
+  <h2>Repositories</h2>
+
+  {% if not github_enabled %}
+  <p class="muted">GitHub is not configured on this server.</p>
+  {% else %}
+  <div class="github-account">
+    {% if github_link %}
+    <form method="post" action="auth/github/unlink">
+      <span>GitHub: <strong>@{{ github_link.login }}</strong></span>
+      <button type="submit" class="plain"
+              onclick="return confirm('Unlink GitHub account @{{ github_link.login }}? Its token is revoked.')">Unlink</button>
+    </form>
+    {% else %}
+    <span class="muted">Link your GitHub account to build from its repositories.</span>
+    <a class="button primary" href="auth/github/login">Connect GitHub</a>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if message %}<p class="message">{{ message }}</p>{% endif %}
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+  {% if repos %}
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Branch or tag</th>
+        {% if show_owner %}<th>Owner</th>{% endif %}
+        <th>Fetched</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in repos %}
+      <tr>
+        <td>
+          {{ r.name }}
+          <div class="muted small"><a href="https://github.com/{{ r.full_name }}" target="_blank" rel="noopener">{{ r.full_name }}</a></div>
+        </td>
+        <td>
+          <select name="ref" hx-post="ui/repos/{{ r.id }}/ref" hx-trigger="change" hx-target="#repos" hx-swap="outerHTML">
+            <optgroup label="Branches">
+              {% for b in r.branches %}
+              <option value="branch:{{ b }}" {% if r.ref_type == 'branch' and r.ref == b %}selected{% endif %}>{{ b }}</option>
+              {% endfor %}
+            </optgroup>
+            {% if r.tags %}
+            <optgroup label="Tags">
+              {% for t in r.tags %}
+              <option value="tag:{{ t }}" {% if r.ref_type == 'tag' and r.ref == t %}selected{% endif %}>{{ t }}</option>
+              {% endfor %}
+            </optgroup>
+            {% endif %}
+          </select>
+        </td>
+        {% if show_owner %}<td>{{ r.owner }}</td>{% endif %}
+        {# app.js rewrites <time> to the browser's local time #}
+        <td><time datetime="{{ r.fetched_at }}">{{ r.fetched_at[:19] | replace('T', ' ') }} UTC</time></td>
+        <td class="actions">
+          <button type="button" hx-post="ui/repos/{{ r.id }}/build" hx-target="#repos" hx-swap="outerHTML"
+                  hx-disabled-elt="this">Build</button>
+          <button type="button" hx-post="ui/repos/{{ r.id }}/fetch" hx-target="#repos" hx-swap="outerHTML"
+                  hx-disabled-elt="this" title="Fetch branches and tags from GitHub">Update</button>
+          <button type="button" hx-post="ui/repos/{{ r.id }}/delete" hx-target="#repos" hx-swap="outerHTML"
+                  hx-confirm="Remove {{ r.full_name }}? Its builds are kept.">Delete</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% elif github_enabled %}
+  <p class="muted">No repositories.</p>
+  {% endif %}
+
+  {% if github_enabled and github_link %}
+  <div class="add-repo">
+    <label>
+      Add a repository
+      <input type="search" name="q" placeholder="search your GitHub repositories" autocomplete="off"
+             hx-get="ui/github/repos" hx-trigger="input changed delay:300ms, focus once"
+             hx-target="#repo-picker">
+    </label>
+    <div id="repo-picker"></div>
+    <form hx-post="ui/repos" hx-target="#repos" hx-swap="outerHTML" hx-disabled-elt="find button">
+      <label>
+        or paste a GitHub URL
+        <input type="text" name="repo" value="{{ value or '' }}" required
+               placeholder="https://github.com/owner/repo">
+      </label>
+      <label>
+        Name
+        <input type="text" name="name" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}"
+               placeholder="defaults to the repository name">
+      </label>
+      <button type="submit">Add repository</button>
+    </form>
+  </div>
+  {% endif %}
+</section>

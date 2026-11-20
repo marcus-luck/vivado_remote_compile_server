@@ -3,7 +3,10 @@
 A small Python script stands in for build.tcl and Vivado.
 """
 
+import dataclasses
+import datetime
 import io
+import json
 import os
 import sys
 import threading
@@ -31,6 +34,13 @@ print("building", name)
 """
 FAILING_BUILD = "import sys\nprint('synthesis failed')\nsys.exit(3)\n"
 SLOW_BUILD = "import time\ntime.sleep(120)\n"
+# Writes its environment where the artifacts are collected.
+ENV_BUILD = """
+import json, os, pathlib, sys
+out = pathlib.Path("bitfiles/generated") / sys.argv[1]
+out.mkdir(parents=True)
+(out / "env.json").write_text(json.dumps(dict(os.environ)))
+"""
 
 
 def make_package(script: str, prefix: str = "") -> bytes:
@@ -101,6 +111,24 @@ def test_build_succeeds_and_artifacts_download(env):
     assert not store.work_dir(build["id"]).exists()
 
 
+def test_build_command_gets_no_server_secrets(env, monkeypatch):
+    settings, database, store, client = env
+    monkeypatch.setenv("BUILDSERVER_SESSION_SECRET", "session-s3cret")
+    monkeypatch.setenv("BUILDSERVER_TOKEN_KEY", "key-s3cret")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("XILINXD_LICENSE_FILE", "2100@licence-host")
+    build = upload(client, make_package(ENV_BUILD)).json()
+    worker.run_once(settings, database, store)
+
+    resp = client.get(f"/api/builds/{build['id']}/artifacts")
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        build_env = json.loads(zf.read("env.json"))
+    assert build_env["XILINXD_LICENSE_FILE"] == "2100@licence-host"
+    for key in build_env:
+        assert not key.upper().startswith(("BUILDSERVER_", "GIT_CONFIG_"))
+    assert "s3cret" not in json.dumps(build_env)
+
+
 def test_package_with_single_top_level_folder(env):
     settings, database, store, client = env
     build = upload(
@@ -123,6 +151,107 @@ def test_failing_build(env):
     assert (
         "synthesis failed" in client.get(f"/api/builds/{build['id']}/log").text
     )
+
+
+def needs_symlinks(tmp_path):
+    """Skips the test where symbolic links cannot be made (Windows)."""
+    try:
+        os.symlink(tmp_path, tmp_path / "probe-link")
+    except OSError:
+        pytest.skip("cannot make symbolic links here")
+    os.unlink(tmp_path / "probe-link")
+
+
+def test_zip_dir_skips_links_and_special_files(tmp_path):
+    needs_symlinks(tmp_path)
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "builds.db").write_text("secret")
+    src = tmp_path / "src"
+    (src / "route").mkdir(parents=True)
+    (src / "fw.bit").write_text("bitstream")
+    (src / "route" / "timing.rpt").write_text("met")
+    os.symlink(secret_dir / "builds.db", src / "db")
+    os.symlink(secret_dir, src / "data")
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(src / "fifo")
+
+    storage.zip_dir(src, tmp_path / "out.zip")
+
+    with zipfile.ZipFile(tmp_path / "out.zip") as zf:
+        assert zf.namelist() == ["fw.bit", "route/timing.rpt"]
+
+
+# Makes the artifact directory a link to a directory outside the package.
+OUTSIDE_BUILD = """
+import os, pathlib, sys
+outside = pathlib.Path(sys.argv[2])
+(outside / "generated" / sys.argv[1]).mkdir(parents=True)
+(outside / "generated" / sys.argv[1] / "builds.db").write_text("secret")
+os.symlink(outside, "bitfiles")
+"""
+
+
+def test_artifact_directory_outside_the_work_directory(env, tmp_path):
+    settings, database, store, client = env
+    needs_symlinks(tmp_path)
+    outside = tmp_path / "outside"
+    settings = dataclasses.replace(
+        settings,
+        build_command=[sys.executable, "build.py", "{name}", str(outside)],
+    )
+    build = upload(client, make_package(OUTSIDE_BUILD)).json()
+    worker.run_once(settings, database, store)
+
+    build = client.get(f"/api/builds/{build['id']}").json()
+    assert build["status"] == "failed"
+    assert "outside the work directory" in build["error"]
+    assert not build["has_artifacts"]
+
+
+def collect(tmp_path, work_dir, artifact_dir="bitfiles/generated/{name}"):
+    """Runs worker.collect_artifacts on a work directory made by the test."""
+    settings = config.Settings(
+        data_dir=tmp_path / "data",
+        build_command=["true"],
+        build_script="build.py",
+        artifact_dir=artifact_dir,
+    )
+    store = storage.Storage(settings.data_dir)
+    build = {"id": "b1", "name": "fw"}
+    store.log_path("b1").parent.mkdir(parents=True)
+    store.log_path("b1").write_text("log")
+    missing = worker.collect_artifacts(
+        settings, store, build, work_dir, work_dir
+    )
+    return missing, store.artifacts_path("b1").exists()
+
+
+def test_artifacts_inside_the_work_directory_are_collected(tmp_path):
+    work_dir = tmp_path / "work"
+    (work_dir / "bitfiles" / "generated" / "fw").mkdir(parents=True)
+    (work_dir / "bitfiles" / "generated" / "fw" / "fw.bit").write_text("bit")
+    assert collect(tmp_path, work_dir) == (None, True)
+
+
+def test_artifact_directory_above_the_work_directory_is_refused(tmp_path):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (tmp_path / "fw").mkdir()
+    (tmp_path / "fw" / "builds.db").write_text("secret")
+    missing, zipped = collect(tmp_path, work_dir, artifact_dir="../{name}")
+    assert "outside the work directory" in missing and not zipped
+
+
+def test_work_directory_that_is_a_link_is_refused(tmp_path):
+    needs_symlinks(tmp_path)
+    real = tmp_path / "real"
+    (real / "bitfiles" / "generated" / "fw").mkdir(parents=True)
+    (real / "bitfiles" / "generated" / "fw" / "builds.db").write_text("x")
+    work_dir = tmp_path / "work"
+    os.symlink(real, work_dir)
+    missing, zipped = collect(tmp_path, work_dir)
+    assert "outside the work directory" in missing and not zipped
 
 
 def test_missing_build_script(env):
@@ -231,6 +360,7 @@ def test_settings_come_from_env_file(tmp_path, monkeypatch):
         "BUILDSERVER_ARTIFACT_DIR=out/{name}\n"
         "BUILDSERVER_BUILD_TIMEOUT=120\n"
         "BUILDSERVER_KEEP_WORKDIR=1\n"
+        "BUILDSERVER_RETENTION_DAYS=14\n"
         "XILINXD_LICENSE_FILE=2100@host\n"
     )
     settings = config.load_settings()
@@ -242,6 +372,7 @@ def test_settings_come_from_env_file(tmp_path, monkeypatch):
     assert settings.build_script == "build.tcl"
     assert settings.artifact_dir == "out/{name}"
     assert settings.keep_workdir is True
+    assert settings.retention_days == 14
     assert settings.build_timeout == 60  # the real environment wins over .env
     assert (
         os.environ["XILINXD_LICENSE_FILE"] == "2100@host"
@@ -293,6 +424,19 @@ def ui_upload(client, package: bytes, name: str = "ui_fw"):
     )
 
 
+def test_health_check_needs_no_sign_in(tmp_path, auth_settings):
+    settings = config.Settings(
+        data_dir=tmp_path,
+        build_command=["true"],
+        build_script="build.py",
+        artifact_dir="out",
+    )
+    client = testclient.TestClient(api.create_app(settings, auth_settings))
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
 def test_front_end_is_served(env):
     client = env[3]
     page = client.get("/").text
@@ -342,3 +486,154 @@ def test_ui_log_polls_until_build_is_over(env):
         in client.get(f"/ui/builds/{build['id']}/log").text
     )
     assert "Download" not in client.get("/ui/builds").text
+
+
+def other_client(client, sign_in, email: str = "dev@team.example.com"):
+    """Returns a second client of the same app, signed in as another user."""
+    other = testclient.TestClient(client.app)
+    sign_in(other, email)
+    return other
+
+
+def test_creator_deletes_build_with_its_files(env, sign_in):
+    settings, database, store, client = env
+    mine = other_client(client, sign_in)
+    build = upload(mine, make_package(GOOD_BUILD)).json()
+    worker.run_once(settings, database, store)
+    assert store.build_dir(build["id"]).is_dir()
+
+    assert mine.delete(f"/api/builds/{build['id']}").status_code == 204
+    assert mine.get(f"/api/builds/{build['id']}").status_code == 404
+    assert not store.build_dir(build["id"]).exists()
+    assert mine.delete(f"/api/builds/{build['id']}").status_code == 404
+
+
+def test_only_creator_or_admin_deletes(env, sign_in):
+    _, _, _, admin = env
+    build = upload(other_client(admin, sign_in), make_package(GOOD_BUILD))
+    build_id = build.json()["id"]
+    stranger = other_client(admin, sign_in, "eve@team.example.com")
+    assert stranger.delete(f"/api/builds/{build_id}").status_code == 404
+    assert "Delete</button>" not in stranger.get("/ui/builds").text
+
+    assert "Delete</button>" in admin.get("/ui/builds").text
+    assert admin.delete(f"/api/builds/{build_id}").status_code == 204
+
+
+def test_builds_are_visible_only_to_creator_and_admin(env, sign_in):
+    settings, database, store, admin = env
+    mine = other_client(admin, sign_in)
+    build = upload(mine, make_package(GOOD_BUILD), name="secret_fw").json()
+    worker.run_once(settings, database, store)
+    stranger = other_client(admin, sign_in, "eve@team.example.com")
+    upload(stranger, make_package(GOOD_BUILD), name="eves_fw")
+
+    base = f"/api/builds/{build['id']}"
+    for path in (base, f"{base}/log", f"{base}/artifacts"):
+        assert stranger.get(path).status_code == 404, path
+        assert mine.get(path).status_code == 200, path
+        assert admin.get(path).status_code == 200, path
+    for path in (
+        f"/ui/builds/{build['id']}/log",
+        f"/ui/builds/{build['id']}/log/text",
+    ):
+        assert stranger.get(path).status_code == 404, path
+    assert stranger.post(f"{base}/cancel").status_code == 404
+
+    assert [b["name"] for b in stranger.get("/api/builds").json()] == [
+        "eves_fw"
+    ]
+    assert [b["name"] for b in mine.get("/api/builds").json()] == ["secret_fw"]
+    assert {b["name"] for b in admin.get("/api/builds").json()} == {
+        "secret_fw",
+        "eves_fw",
+    }
+    assert "secret_fw" not in stranger.get("/ui/builds").text
+    assert "secret_fw" in admin.get("/ui/builds").text
+
+
+def test_strangers_cannot_cancel_from_the_table(env, sign_in):
+    _, database, _, admin = env
+    build = upload(other_client(admin, sign_in), make_package(GOOD_BUILD))
+    stranger = other_client(admin, sign_in, "eve@team.example.com")
+    stranger.post(f"/ui/builds/{build.json()['id']}/cancel")
+    assert database.get(build.json()["id"])["status"] == "queued"
+
+
+def test_deleted_queued_build_is_not_run(env):
+    settings, database, store, client = env
+    build = upload(client, make_package(GOOD_BUILD)).json()
+    assert client.delete(f"/api/builds/{build['id']}").status_code == 204
+    assert worker.run_once(settings, database, store) is False
+
+
+def test_running_build_cannot_be_deleted(env):
+    _, database, store, client = env
+    build = upload(client, make_package(GOOD_BUILD)).json()
+    database.claim_next()
+    resp = client.delete(f"/api/builds/{build['id']}")
+    assert resp.status_code == 409
+    assert store.package_path(build["id"]).is_file()
+    assert "Delete</button>" not in client.get("/ui/builds").text
+
+
+def test_ui_delete(env):
+    _, _, _, client = env
+    ui_upload(client, make_package(GOOD_BUILD), name="doomed")
+    build = client.get("/api/builds").json()[0]
+    assert "Delete</button>" in client.get("/ui/builds").text
+    table = client.post(f"/ui/builds/{build['id']}/delete").text
+    assert "doomed" not in table and "No builds yet." in table
+
+
+def test_files_left_by_a_failed_delete_are_swept_later(env, monkeypatch):
+    settings, database, store, client = env
+    gone = upload(client, make_package(GOOD_BUILD), name="gone").json()
+    kept = upload(client, make_package(GOOD_BUILD), name="kept").json()
+    worker.run_once(settings, database, store)
+
+    def locked(self, build_id):
+        raise PermissionError(f"{build_id}/artifacts.zip is open")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage.Storage, "delete_build_dir", locked)
+        assert client.delete(f"/api/builds/{gone['id']}").status_code == 204
+    assert client.get(f"/api/builds/{gone['id']}").status_code == 404
+    assert store.build_dir(gone["id"]).is_dir()
+
+    # Young directories may belong to a build being created: left alone.
+    assert worker.delete_orphaned_dirs(database, store) == 0
+    later = time.time() + 2 * 3600
+    assert worker.delete_orphaned_dirs(database, store, later) == 1
+    assert not store.build_dir(gone["id"]).exists()
+    assert store.package_path(kept["id"]).is_file()
+
+
+def test_retention_expires_old_files_and_keeps_log(env):
+    settings, database, store, client = env
+    old = upload(client, make_package(GOOD_BUILD), name="old").json()
+    worker.run_once(settings, database, store)
+    later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        days=2
+    )
+    recent = upload(client, make_package(GOOD_BUILD), name="new").json()
+
+    # Disabled by default.
+    assert worker.expire_old_files(settings, database, store, later) == 0
+
+    settings = dataclasses.replace(settings, retention_days=1)
+    # The recent build is still queued, so it has no finish time yet.
+    assert worker.expire_old_files(settings, database, store, later) == 1
+    assert not store.package_path(old["id"]).exists()
+    assert not store.artifacts_path(old["id"]).exists()
+    assert store.log_path(old["id"]).is_file()
+    old = client.get(f"/api/builds/{old['id']}").json()
+    assert old["files_expired_at"] and not old["has_artifacts"]
+    assert old["status"] == "succeeded"
+    assert "files expired" in client.get("/ui/builds").text
+    assert client.get(f"/api/builds/{old['id']}/log").text
+
+    worker.run_once(settings, database, store)
+    assert worker.expire_old_files(settings, database, store) == 0
+    assert store.artifacts_path(recent["id"]).is_file()
+    assert store.package_path(recent["id"]).is_file()

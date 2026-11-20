@@ -1,0 +1,16 @@
+# Secrets and local state never go into an image.
+.env
+deploy/caddy.env
+client_secret_*.json
+data/
+CLAUDE.local.md
+
+# Not needed in the images.
+.git/
+.venv/
+.claude/
+.vscode/
+.ruff_cache/
+.pytest_cache/
+**/__pycache__/
+.deploy-history

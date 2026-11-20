@@ -6,3 +6,10 @@ data/
 .claude/settings.local.json
 client_secret_*.json
 deploy/caddy.env
+# Personal Claude Code setup (ClickUp hook and skill)
+CLAUDE.local.md
+.claude/hooks/
+.claude/skills/clickup-tasks/
+
+# Deploys made by deploy/buildserverctl on the server
+.deploy-history

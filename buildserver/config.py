@@ -33,6 +33,16 @@ class Settings:
         max_upload_bytes: Largest accepted build package, in bytes.
         keep_workdir: Whether to keep the extracted package after the build.
         poll_interval: Seconds the worker sleeps when the queue is empty.
+        git: Git executable, used to clone repositories for builds.
+        retention_days: Days after a build finishes before its package and
+            artifacts are deleted; 0 keeps them forever.
+        retention_interval: Seconds between the worker's retention passes.
+        token_key: Key the GitHub tokens are encrypted with in the database
+            (see buildserver.crypto); empty if GitHub is not used.
+        work_dir: Directory the builds' work directories are made in, or None
+            for data_dir/work.
+        build_user: Account the build command runs as (see
+            buildserver.sandbox), or empty to run it as the worker's own.
     """
 
     data_dir: pathlib.Path
@@ -43,6 +53,12 @@ class Settings:
     max_upload_bytes: int = 2 * 1024**3
     keep_workdir: bool = False
     poll_interval: float = 2.0
+    git: str = "git"
+    retention_days: float = 0
+    retention_interval: float = 3600
+    token_key: str = dataclasses.field(default="", repr=False)
+    work_dir: pathlib.Path | None = None
+    build_user: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,6 +75,9 @@ class AuthSettings:
             how the first administrator gets in.
         allowed_domains: Email domains whose Google accounts may sign in
             without being added by an administrator first.
+        github_client_id: Client id of the GitHub OAuth App users link their
+            GitHub accounts through, or empty if GitHub is not configured.
+        github_client_secret: Client secret of the GitHub OAuth App.
     """
 
     public_url: str
@@ -67,6 +86,13 @@ class AuthSettings:
     session_secret: str
     admin_emails: frozenset[str]
     allowed_domains: frozenset[str] = frozenset()
+    github_client_id: str = ""
+    github_client_secret: str = ""
+
+    @property
+    def github_enabled(self) -> bool:
+        """Whether users can link GitHub accounts and build repositories."""
+        return bool(self.github_client_id and self.github_client_secret)
 
 
 def _load_env_file() -> None:
@@ -105,16 +131,18 @@ def load_settings() -> Settings:
     """Builds the settings from the .env file and the environment.
 
     Every path comes from the configuration; none has a default in the code.
-    The .env file is loaded into os.environ, so the build command inherits
-    its variables too (a Vivado licence server, for example).
+    The .env file is loaded into os.environ. The build command gets the
+    variables that do not start with BUILDSERVER_ (a Vivado licence server,
+    for example); see worker.build_env().
 
     Returns:
         The settings.
 
     Raises:
         ValueError: If a required variable is missing,
-            BUILDSERVER_BUILD_COMMAND is not a JSON list of strings, or a
-            numeric variable does not hold a number.
+            BUILDSERVER_BUILD_COMMAND is not a JSON list of strings, a
+            numeric variable does not hold a number, or
+            BUILDSERVER_BUILD_USER is set on Windows.
     """
     _load_env_file()
     env = os.environ
@@ -153,7 +181,39 @@ def load_settings() -> Settings:
             or defaults["max_upload_bytes"]
         ),
         keep_workdir=env.get("BUILDSERVER_KEEP_WORKDIR", "") not in ("", "0"),
+        git=env.get("BUILDSERVER_GIT") or defaults["git"],
+        retention_days=float(
+            env.get("BUILDSERVER_RETENTION_DAYS") or defaults["retention_days"]
+        ),
+        token_key=env.get("BUILDSERVER_TOKEN_KEY", ""),
+        work_dir=(
+            pathlib.Path(env["BUILDSERVER_WORK_DIR"]).resolve()
+            if env.get("BUILDSERVER_WORK_DIR")
+            else None
+        ),
+        build_user=_build_user(env.get("BUILDSERVER_BUILD_USER", "")),
     )
+
+
+def _build_user(name: str) -> str:
+    """Checks the BUILDSERVER_BUILD_USER setting.
+
+    Args:
+        name: The configured account name, possibly empty.
+
+    Returns:
+        The account name, or an empty string.
+
+    Raises:
+        ValueError: If an account is set on Windows, where running the build
+            as another account is not supported.
+    """
+    if name and os.name == "nt":
+        raise ValueError(
+            "BUILDSERVER_BUILD_USER is only supported on Linux (see the"
+            " Docker deployment in README.md)"
+        )
+    return name
 
 
 def load_auth_settings() -> AuthSettings:
@@ -174,5 +234,9 @@ def load_auth_settings() -> AuthSettings:
         admin_emails=_split(_require("BUILDSERVER_ADMIN_EMAILS")),
         allowed_domains=_split(
             os.environ.get("BUILDSERVER_ALLOWED_DOMAINS", "")
+        ),
+        github_client_id=os.environ.get("BUILDSERVER_GITHUB_CLIENT_ID", ""),
+        github_client_secret=os.environ.get(
+            "BUILDSERVER_GITHUB_CLIENT_SECRET", ""
         ),
     )

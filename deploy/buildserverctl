@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# Deploys and manages the build server on its Linux host.
+#
+# Runs from the git checkout it lives in (e.g. /opt/buildserver), as the
+# deploy account, which is in group docker. Only provision needs sudo.
+#
+#   sudo deploy/buildserverctl provision   set up the host, once
+#   deploy/buildserverctl deploy [ref]     test and run a branch, tag or SHA
+#   deploy/buildserverctl rollback         run the previously deployed SHA
+#   deploy/buildserverctl status           what runs, health, queue, disk
+#   deploy/buildserverctl logs [service]   follow the logs
+#   deploy/buildserverctl backup           copy the database and .env
+#   deploy/buildserverctl restore <file>   replace the database
+#   deploy/buildserverctl test             run the tests in the worker image
+#   deploy/buildserverctl ca-cert          print Caddy's root certificate
+#
+# See "Deployment (Docker)" in README.md.
+
+# The cmd_* functions are called through "cmd_$command".
+# shellcheck disable=SC2329
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+BACKUP_DIR="${BUILDSERVER_BACKUP_DIR:-/var/backups/buildserver}"
+BACKUPS_KEPT=14
+HISTORY="$ROOT/.deploy-history"
+HEALTH_TIMEOUT=120
+TEST_IMAGE=buildserver-test
+# Fields of .env that must be filled in before a deploy.
+REQUIRED_ENV=(
+  BUILDSERVER_VIVADO
+  BUILDSERVER_PUBLIC_URL
+  BUILDSERVER_GOOGLE_CLIENT_ID
+  BUILDSERVER_GOOGLE_CLIENT_SECRET
+  BUILDSERVER_SESSION_SECRET
+  BUILDSERVER_ADMIN_EMAILS
+  BUILDSERVER_TOKEN_KEY
+)
+
+usage() {
+  sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+  exit 2
+}
+
+log() { printf '==> %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+compose() { docker compose --project-directory "$ROOT" "$@"; }
+
+# Prints the value of a KEY=value line of an env file, without quotes.
+env_value() {
+  local key="$1" file="$2"
+  sed -n "s/^${key}=//p" "$file" | tail -n 1 | sed "s/^['\"]//; s/['\"]\$//"
+}
+
+# Sets KEY=value in an env file, replacing a commented or empty line of it.
+set_env_value() {
+  local key="$1" value="$2" file="$3"
+  if grep -qE "^#?${key}=" "$file"; then
+    sed -i -E "s|^#?${key}=.*|${key}=${value}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >>"$file"
+  fi
+}
+
+random_secret() {
+  python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+}
+
+# A Fernet key, as buildserver.crypto.generate_key makes it.
+random_fernet_key() {
+  python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())'
+}
+
+# Prints the newest Vivado executable under /opt/Xilinx, either layout:
+# Vivado/<version>/bin (up to 2024.2) or <version>/Vivado/bin (2025.1 on).
+find_vivado() {
+  local dir="${VIVADO_DIR:-/opt/Xilinx}"
+  find "$dir" -maxdepth 4 -path '*bin/vivado' -type f 2>/dev/null \
+    | sort -V | tail -n 1
+}
+
+# Prints the fields of .env and caddy.env still to be filled in.
+missing_settings() {
+  local key value
+  [[ -f "$ROOT/.env" ]] || { echo ".env (file missing)"; return; }
+  for key in "${REQUIRED_ENV[@]}"; do
+    value="$(env_value "$key" "$ROOT/.env")"
+    if [[ -z "$value" || "$value" == change-me ]]; then
+      echo ".env: $key"
+    fi
+  done
+  if [[ "$(env_value BUILDSERVER_PUBLIC_URL "$ROOT/.env")" != https://* ]]; then
+    echo ".env: BUILDSERVER_PUBLIC_URL (must be https://, the Caddy host name)"
+  fi
+  [[ -f "$ROOT/deploy/caddy.env" ]] || { echo "deploy/caddy.env (file missing)"; return; }
+  case "$(caddy_tls)" in
+    internal) ;;
+    cloudflare)
+      if [[ -z "$(env_value CLOUDFLARE_API_TOKEN "$ROOT/deploy/caddy.env")" ]]; then
+        echo "deploy/caddy.env: CLOUDFLARE_API_TOKEN"
+      fi
+      ;;
+    *) echo "deploy/caddy.env: CADDY_TLS (cloudflare or internal)" ;;
+  esac
+}
+
+# Prints the certificate type set in caddy.env; cloudflare when unset.
+caddy_tls() {
+  local value
+  value="$(env_value CADDY_TLS "$ROOT/deploy/caddy.env" 2>/dev/null)"
+  echo "${value:-cloudflare}"
+}
+
+api_running() {
+  [[ -n "$(compose ps -q --status running api 2>/dev/null)" ]]
+}
+
+api_health() {
+  local id
+  id="$(compose ps -q api 2>/dev/null)"
+  [[ -n "$id" ]] || { echo "not running"; return; }
+  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no health check{{end}}' "$id"
+}
+
+wait_healthy() {
+  local deadline=$((SECONDS + HEALTH_TIMEOUT)) health
+  while ((SECONDS < deadline)); do
+    health="$(api_health)"
+    [[ "$health" == healthy ]] && return 0
+    sleep 3
+  done
+  log "api is $(api_health) after ${HEALTH_TIMEOUT}s"
+  return 1
+}
+
+# Prints the SHA of the last deploy, or nothing.
+deployed_sha() {
+  [[ -f "$HISTORY" ]] && tail -n 1 "$HISTORY" | awk '{print $2}'
+  true
+}
+
+# Resolves a branch, tag or SHA to a commit, preferring the remote branch.
+resolve_ref() {
+  local ref="$1"
+  git -C "$ROOT" rev-parse -q --verify "origin/${ref}^{commit}" 2>/dev/null \
+    || git -C "$ROOT" rev-parse -q --verify "${ref}^{commit}" 2>/dev/null \
+    || die "unknown branch, tag or commit: $ref"
+}
+
+checkout() {
+  git -C "$ROOT" -c advice.detachedHead=false checkout -q --detach "$1"
+}
+
+start_stack() {
+  log "starting the stack at $(git -C "$ROOT" rev-parse --short HEAD)"
+  compose up -d --build --remove-orphans
+}
+
+# Commands ###################################################################
+
+cmd_provision() {
+  [[ $EUID -eq 0 ]] || die "provision needs root: sudo $0 provision"
+  local user="${SUDO_USER:-}"
+  [[ -n "$user" && "$user" != root ]] \
+    || die "run it with sudo from the deploy account, not as root"
+
+  if ! command -v docker >/dev/null; then
+    log "installing Docker"
+    curl -fsSL https://get.docker.com | sh
+  fi
+  if ! id -nG "$user" | grep -qw docker; then
+    log "adding $user to group docker (log in again to use it)"
+    usermod -aG docker "$user"
+  fi
+
+  local vivado
+  vivado="$(find_vivado)"
+  if [[ -z "$vivado" ]]; then
+    log "warning: no Vivado under ${VIVADO_DIR:-/opt/Xilinx}; install it before building"
+  else
+    log "Vivado: $vivado"
+  fi
+
+  if [[ ! -f "$ROOT/.env" ]]; then
+    log "creating .env with new secrets"
+    install -m 600 -o "$user" -g "$user" "$ROOT/.env.template" "$ROOT/.env"
+    set_env_value BUILDSERVER_SESSION_SECRET "$(random_secret)" "$ROOT/.env"
+    set_env_value BUILDSERVER_TOKEN_KEY "$(random_fernet_key)" "$ROOT/.env"
+  fi
+  # Also on a later run, once Vivado is installed; a set path is kept.
+  if [[ -n "$vivado" && -z "$(env_value BUILDSERVER_VIVADO "$ROOT/.env")" ]]; then
+    log "setting BUILDSERVER_VIVADO=$vivado"
+    set_env_value BUILDSERVER_VIVADO "$vivado" "$ROOT/.env"
+  fi
+  if [[ ! -f "$ROOT/deploy/caddy.env" ]]; then
+    log "creating deploy/caddy.env"
+    install -m 600 -o "$user" -g "$user" \
+      "$ROOT/deploy/caddy.env.template" "$ROOT/deploy/caddy.env"
+  fi
+
+  install -d -m 700 -o "$user" -g "$user" "$BACKUP_DIR"
+
+  local unit
+  for unit in buildserver-backup.service buildserver-backup.timer; do
+    sed -e "s|@ROOT@|$ROOT|g" -e "s|@USER@|$user|g" \
+      "$ROOT/deploy/$unit" >"/etc/systemd/system/$unit.new"
+    if cmp -s "/etc/systemd/system/$unit.new" "/etc/systemd/system/$unit"; then
+      rm "/etc/systemd/system/$unit.new"
+    else
+      mv "/etc/systemd/system/$unit.new" "/etc/systemd/system/$unit"
+      log "installed $unit"
+    fi
+  done
+  systemctl daemon-reload
+  systemctl enable --now buildserver-backup.timer >/dev/null 2>&1
+
+  local missing line
+  missing="$(missing_settings)"
+  if [[ -n "$missing" ]]; then
+    log "fill in before the first deploy:"
+    while read -r line; do printf '    %s\n' "$line" >&2; done <<<"$missing"
+  else
+    log "host ready: run $0 deploy"
+  fi
+}
+
+# deploy calls this in a condition, where set -e is off. Each step returns
+# on failure itself, or a failed build would run the old test image.
+cmd_test() {
+  log "building the test image"
+  docker build -q --target worker-test -t "$TEST_IMAGE" "$ROOT" >/dev/null \
+    || { log "the test image did not build"; return 1; }
+  log "running the tests, sandbox tests included"
+  docker run --rm --init -e BUILDSERVER_TEST_SANDBOX=1 "$TEST_IMAGE" || return 1
+}
+
+cmd_deploy() {
+  local ref="main" force=0 skip_tests=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      --skip-tests) skip_tests=1 ;;
+      -*) die "unknown option: $arg" ;;
+      *) ref="$arg" ;;
+    esac
+  done
+
+  local missing
+  missing="$(missing_settings)"
+  [[ -z "$missing" ]] || die "settings missing:"$'\n'"$missing"
+  [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]] \
+    || die "the checkout has local changes; commit or discard them"
+
+  if api_running; then
+    if ! compose exec -T api python -m buildserver.admin busy && ((!force)); then
+      die "a build is running; wait, or deploy with --force (it fails the build)"
+    fi
+    cmd_backup
+  fi
+
+  log "fetching"
+  git -C "$ROOT" fetch -q --tags --prune --force origin
+  local old new
+  old="$(git -C "$ROOT" rev-parse HEAD)"
+  new="$(resolve_ref "$ref")"
+  log "deploying $ref ($(git -C "$ROOT" log -1 --format='%h %s' "$new"))"
+  checkout "$new"
+
+  if ((!skip_tests)) && ! cmd_test; then
+    checkout "$old"
+    die "tests failed; nothing deployed, checkout back at ${old:0:7}"
+  fi
+
+  if ! start_stack || ! wait_healthy; then
+    compose logs --tail 30 api >&2 || true
+    log "rolling back to ${old:0:7}"
+    checkout "$old"
+    start_stack
+    wait_healthy || log "warning: the old version is not healthy either"
+    die "deploy of $ref failed. Rolled back to ${old:0:7}."
+  fi
+  printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$new" "$ref" >>"$HISTORY"
+  log "deployed $ref at ${new:0:7}"
+}
+
+cmd_rollback() {
+  [[ -f "$HISTORY" ]] || die "nothing deployed yet"
+  local current previous
+  current="$(deployed_sha)"
+  previous="$(awk -v cur="$current" '$2 != cur {sha = $2} END {print sha}' "$HISTORY")"
+  [[ -n "$previous" ]] || die "no earlier deploy to roll back to"
+  log "rolling back to ${previous:0:7}"
+  cmd_deploy "$previous" --skip-tests "$@"
+}
+
+cmd_status() {
+  local head deployed
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  deployed="$(deployed_sha)"
+  echo "checkout:  $(git -C "$ROOT" log -1 --format='%h %s (%cr)' HEAD)"
+  if [[ -z "$deployed" ]]; then
+    echo "deployed:  never through this script"
+  else
+    echo "deployed:  $(tail -n 1 "$HISTORY" | awk '{print substr($2, 1, 7), $3, "at", $1}')"
+    [[ "$deployed" == "$head" ]] || echo "           warning: the checkout is not the deployed commit"
+  fi
+  echo "api:       $(api_health)"
+  if api_running; then
+    echo "builds:    $(compose exec -T api python -m buildserver.admin busy || true)"
+  fi
+  echo "vivado:    $(find_vivado || true)"
+  echo "backups:   $(find "$BACKUP_DIR" -maxdepth 1 -name 'builds-*.db' 2>/dev/null | wc -l)," \
+    "latest $(find "$BACKUP_DIR" -maxdepth 1 -name 'builds-*.db' -printf '%f\n' 2>/dev/null | sort | tail -n 1)"
+  echo "disk:      $(df -h --output=avail "$ROOT" | tail -n 1 | tr -d ' ') free"
+  echo
+  compose ps
+  echo
+  docker system df -v 2>/dev/null | sed -n '/^VOLUME NAME/,/^$/p' | grep -E 'VOLUME NAME|buildserver_' || true
+}
+
+cmd_logs() {
+  compose logs -f --tail 200 "$@"
+}
+
+cmd_backup() {
+  if ! api_running; then
+    log "api not running; no backup taken"
+    return 0
+  fi
+  [[ -d "$BACKUP_DIR" && -w "$BACKUP_DIR" ]] \
+    || die "$BACKUP_DIR is missing or not writable; run: sudo $0 provision"
+  local stamp dest
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dest="$BACKUP_DIR/builds-$stamp.db"
+  install -m 600 /dev/null "$dest.part"
+  if ! compose exec -T api python -m buildserver.admin backup - >"$dest.part"; then
+    rm -f "$dest.part"
+    die "backup failed: the database export failed"
+  fi
+  if [[ "$(head -c 15 "$dest.part")" != "SQLite format 3" ]]; then
+    rm -f "$dest.part"
+    die "backup failed: the export is not an SQLite database"
+  fi
+  mv "$dest.part" "$dest"
+  # The database is useless without BUILDSERVER_TOKEN_KEY from .env.
+  install -m 600 "$ROOT/.env" "$BACKUP_DIR/env-$stamp" \
+    || die "backup failed: cannot copy .env"
+  local pattern
+  for pattern in 'builds-*.db' 'env-*'; do
+    find "$BACKUP_DIR" -maxdepth 1 -name "$pattern" -printf '%f\n' \
+      | sort -r | tail -n +$((BACKUPS_KEPT + 1)) \
+      | while read -r old; do rm -f "$BACKUP_DIR/$old"; done
+  done
+  log "backup: $dest"
+}
+
+# Prints the root certificate of Caddy's own CA (CADDY_TLS=internal), for
+# the clients to trust.
+cmd_ca-cert() {
+  [[ "$(caddy_tls)" == internal ]] \
+    || die "CADDY_TLS is $(caddy_tls); only internal certificates have a local CA"
+  compose exec -T caddy cat /data/caddy/pki/authorities/local/root.crt
+}
+
+cmd_restore() {
+  local file="${1:-}"
+  [[ -n "$file" ]] || die "usage: $0 restore <backup file>"
+  [[ -f "$file" ]] || die "no such file: $file"
+  cmd_backup
+  log "stopping api and worker"
+  compose stop api worker
+  if ! compose run --rm --no-deps -T worker \
+    python -m buildserver.admin restore - <"$file"; then
+    compose up -d
+    die "restore failed, see above. The old database is still in service."
+  fi
+  compose up -d
+  wait_healthy || die "api not healthy after the restore"
+  log "restored $file"
+}
+
+main() {
+  local command="${1:-}"
+  [[ -n "$command" ]] || usage
+  shift
+  cd "$ROOT"
+  case "$command" in
+    provision | deploy | rollback | status | logs | backup | restore | test | ca-cert)
+      "cmd_$command" "$@" ;;
+    -h | --help | help) usage ;;
+    *) die "unknown command: $command (see $0 --help)" ;;
+  esac
+}
+
+# Everything above is only definitions, and this one line runs: git checkout
+# can replace this file while a deploy runs without bash reading the new one.
+main "$@"; exit $?
