@@ -209,6 +209,51 @@ def test_artifact_directory_outside_the_work_directory(env, tmp_path):
     assert not build["has_artifacts"]
 
 
+def collect(tmp_path, work_dir, artifact_dir="bitfiles/generated/{name}"):
+    """Runs worker.collect_artifacts on a work directory made by the test."""
+    settings = config.Settings(
+        data_dir=tmp_path / "data",
+        build_command=["true"],
+        build_script="build.py",
+        artifact_dir=artifact_dir,
+    )
+    store = storage.Storage(settings.data_dir)
+    build = {"id": "b1", "name": "fw"}
+    store.log_path("b1").parent.mkdir(parents=True)
+    store.log_path("b1").write_text("log")
+    missing = worker.collect_artifacts(
+        settings, store, build, work_dir, work_dir
+    )
+    return missing, store.artifacts_path("b1").exists()
+
+
+def test_artifacts_inside_the_work_directory_are_collected(tmp_path):
+    work_dir = tmp_path / "work"
+    (work_dir / "bitfiles" / "generated" / "fw").mkdir(parents=True)
+    (work_dir / "bitfiles" / "generated" / "fw" / "fw.bit").write_text("bit")
+    assert collect(tmp_path, work_dir) == (None, True)
+
+
+def test_artifact_directory_above_the_work_directory_is_refused(tmp_path):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (tmp_path / "fw").mkdir()
+    (tmp_path / "fw" / "builds.db").write_text("secret")
+    missing, zipped = collect(tmp_path, work_dir, artifact_dir="../{name}")
+    assert "outside the work directory" in missing and not zipped
+
+
+def test_work_directory_that_is_a_link_is_refused(tmp_path):
+    needs_symlinks(tmp_path)
+    real = tmp_path / "real"
+    (real / "bitfiles" / "generated" / "fw").mkdir(parents=True)
+    (real / "bitfiles" / "generated" / "fw" / "builds.db").write_text("x")
+    work_dir = tmp_path / "work"
+    os.symlink(real, work_dir)
+    missing, zipped = collect(tmp_path, work_dir)
+    assert "outside the work directory" in missing and not zipped
+
+
 def test_missing_build_script(env):
     settings, database, store, client = env
     buf = io.BytesIO()

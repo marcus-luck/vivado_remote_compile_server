@@ -385,6 +385,8 @@ def run_build(
             missing = collect_artifacts(settings, store, build, work_dir, root)
             if missing and status == db.SUCCEEDED:
                 status, error = db.FAILED, missing
+            elif missing:
+                _logger.warning("build %s: %s", build_id, missing)
     except Exception as e:  # pylint: disable=broad-exception-caught
         _logger.exception("build %s failed", build_id)
         status, error = db.FAILED, f"{type(e).__name__}: {e}"
@@ -416,8 +418,8 @@ def collect_artifacts(
     The worker can read what the build account cannot, so the artifacts must
     not reach outside the work directory. The artifact directory is refused
     if it, or a directory above it, is a symbolic link, and only regular
-    files are zipped. Hard links are no way out either: the build account
-    cannot enter the data directory, and the kernel protects hard links.
+    files are zipped. Hard links are no way out either: the work root is its
+    own mount, and the build account cannot enter the data directory.
 
     Args:
         settings: The server settings.
@@ -433,11 +435,7 @@ def collect_artifacts(
         config.NAME_PLACEHOLDER, build["name"]
     )
     artifact_dir = root / relative
-    if not artifact_dir.resolve().is_relative_to(work_dir.resolve()) or any(
-        path.is_symlink()
-        for path in (artifact_dir, *artifact_dir.parents)
-        if path.is_relative_to(work_dir)
-    ):
+    if _reaches_outside(work_dir, artifact_dir):
         return f"artifact directory {relative} is outside the work directory"
     if not artifact_dir.is_dir() or not storage.regular_files(artifact_dir):
         return f"build produced no artifacts in {relative}"
@@ -447,6 +445,26 @@ def collect_artifacts(
         extra={"build.log": store.log_path(build["id"])},
     )
     return None
+
+
+def _reaches_outside(work_dir: pathlib.Path, path: pathlib.Path) -> bool:
+    """Tells whether a path under the work directory can lead out of it.
+
+    Args:
+        work_dir: The work directory of a build.
+        path: A path inside it, which need not exist.
+
+    Returns:
+        True if the path resolves outside work_dir, or if it, work_dir or a
+        directory between them is a symbolic link.
+    """
+    if not path.resolve().is_relative_to(work_dir.resolve()):
+        return True
+    return any(
+        part.is_symlink()
+        for part in (path, *path.parents)
+        if part.is_relative_to(work_dir)
+    )
 
 
 def _empty_dir(path: pathlib.Path) -> None:
