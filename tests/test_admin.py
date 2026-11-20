@@ -38,11 +38,28 @@ def test_backup_and_restore_round_trip(database, tmp_path):
     queue(database, "b2")  # after the backup: gone once it is restored
 
     copy.seek(0)
-    admin.restore(database.path, copy)
+    kept = admin.restore(database.path, copy)
 
     ids = [build["id"] for build in database.list_builds(10)]
     assert ids == ["b1"]
-    assert list(database.path.parent.iterdir()) == [database.path]
+    # The old database, write-ahead log included, is kept aside.
+    assert kept.name.startswith("builds.db.before-restore-")
+    old = sorted(b["id"] for b in db.Database(kept).list_builds(10))
+    assert old == ["b1", "b2"]
+    leftovers = {p.name for p in database.path.parent.iterdir()}
+    assert leftovers <= {
+        database.path.name,
+        kept.name,
+        f"{kept.name}-wal",
+        f"{kept.name}-shm",
+    }
+
+
+def test_restore_without_a_database_keeps_nothing(tmp_path, database):
+    copy = io.BytesIO()
+    admin.backup(database, copy)
+    copy.seek(0)
+    assert admin.restore(tmp_path / "new" / "builds.db", copy) is None
 
 
 def test_restore_refuses_a_file_that_is_not_a_database(database):

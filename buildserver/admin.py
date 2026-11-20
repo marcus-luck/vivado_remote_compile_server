@@ -12,6 +12,7 @@ database: stop the api and the worker first.
 """
 
 import argparse
+import datetime
 import os
 import pathlib
 import shutil
@@ -89,15 +90,20 @@ def check_backup(path: pathlib.Path) -> None:
         raise ValueError("not a build server database: no builds table")
 
 
-def restore(db_path: pathlib.Path, source: BinaryIO) -> None:
+def restore(db_path: pathlib.Path, source: BinaryIO) -> pathlib.Path | None:
     """Replaces the database with a backup.
 
-    The backup is checked before anything is replaced. Only run this while
-    the api and the worker are stopped.
+    The backup is checked before anything is replaced. The old database is
+    kept next to it as builds.db.before-restore-<time>, with its write-ahead
+    log, so a wrong restore can be undone. Only run this while the api and
+    the worker are stopped.
 
     Args:
         db_path: Location of the database to replace.
         source: The backup.
+
+    Returns:
+        Where the old database was kept, or None if there was none.
 
     Raises:
         ValueError: If the backup is not a build server database.
@@ -109,14 +115,37 @@ def restore(db_path: pathlib.Path, source: BinaryIO) -> None:
         with os.fdopen(fd, "wb") as f:
             shutil.copyfileobj(source, f)
         check_backup(tmp)
-        # The write-ahead log of the old database must not be applied to
-        # the restored one.
-        for suffix in ("-wal", "-shm"):
-            pathlib.Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+        kept = _keep_old_database(db_path)
         os.replace(tmp, db_path)
+        return kept
     finally:
         for leftover in ("", "-wal", "-shm", "-journal"):
             pathlib.Path(f"{tmp}{leftover}").unlink(missing_ok=True)
+
+
+def _keep_old_database(db_path: pathlib.Path) -> pathlib.Path | None:
+    """Moves a database and its write-ahead log aside.
+
+    The write-ahead log moves with it, so it is applied when the kept copy
+    is opened, and not to the database that takes its place.
+
+    Args:
+        db_path: The database.
+
+    Returns:
+        The new location, or None if there was no database.
+    """
+    pathlib.Path(f"{db_path}-shm").unlink(missing_ok=True)
+    if not db_path.exists():
+        pathlib.Path(f"{db_path}-wal").unlink(missing_ok=True)
+        return None
+    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    kept = db_path.with_name(f"{db_path.name}.before-restore-{stamp}")
+    wal = pathlib.Path(f"{db_path}-wal")
+    if wal.exists():
+        os.replace(wal, f"{kept}-wal")
+    os.replace(db_path, kept)
+    return kept
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -144,13 +173,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "restore":
         try:
             if args.source == "-":
-                restore(db_path, sys.stdin.buffer)
+                kept = restore(db_path, sys.stdin.buffer)
             else:
                 with open(args.source, "rb") as f:
-                    restore(db_path, f)
+                    kept = restore(db_path, f)
         except ValueError as e:
             print(f"restore refused: {e}", file=sys.stderr)
             return 2
+        if kept:
+            print(f"kept the old database as {kept}", file=sys.stderr)
         print(f"restored {db_path}", file=sys.stderr)
         return 0
     # Opening the database migrates it, which a restore must not do to the

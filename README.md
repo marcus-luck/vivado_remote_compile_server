@@ -315,9 +315,10 @@ To restore a backup:
 deploy/buildserverctl restore /var/backups/buildserver/builds-<date>.db
 ```
 
-`restore` makes a backup of the current database first. Then it stops the
-api and the worker, does a check of the file and puts it in position.
-Packages, logs and artifacts are not in the backup.
+`restore` stops the api and the worker, does a check of the file and puts
+it in position. It keeps the old database in the `data` volume as
+`builds.db.before-restore-<time>`. If the api runs, `restore` also makes a
+backup first. Packages, logs and artifacts are not in the backup.
 
 ### Build isolation
 
