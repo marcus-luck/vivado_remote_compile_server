@@ -226,11 +226,14 @@ cmd_provision() {
   fi
 }
 
+# deploy calls this in a condition, where set -e is off. Each step returns
+# on failure itself, or a failed build would run the old test image.
 cmd_test() {
   log "building the test image"
-  docker build -q --target worker-test -t "$TEST_IMAGE" "$ROOT" >/dev/null
+  docker build -q --target worker-test -t "$TEST_IMAGE" "$ROOT" >/dev/null \
+    || { log "the test image did not build"; return 1; }
   log "running the tests, sandbox tests included"
-  docker run --rm --init -e BUILDSERVER_TEST_SANDBOX=1 "$TEST_IMAGE"
+  docker run --rm --init -e BUILDSERVER_TEST_SANDBOX=1 "$TEST_IMAGE" || return 1
 }
 
 cmd_deploy() {
@@ -332,13 +335,19 @@ cmd_backup() {
   local stamp dest
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   dest="$BACKUP_DIR/builds-$stamp.db"
-  (
-    umask 077
-    compose exec -T api python -m buildserver.admin backup - >"$dest.part"
-    mv "$dest.part" "$dest"
-    # The database is useless without BUILDSERVER_TOKEN_KEY from .env.
-    cp "$ROOT/.env" "$BACKUP_DIR/env-$stamp"
-  ) || { rm -f "$dest.part"; die "backup failed"; }
+  install -m 600 /dev/null "$dest.part"
+  if ! compose exec -T api python -m buildserver.admin backup - >"$dest.part"; then
+    rm -f "$dest.part"
+    die "backup failed: the database export failed"
+  fi
+  if [[ "$(head -c 15 "$dest.part")" != "SQLite format 3" ]]; then
+    rm -f "$dest.part"
+    die "backup failed: the export is not an SQLite database"
+  fi
+  mv "$dest.part" "$dest"
+  # The database is useless without BUILDSERVER_TOKEN_KEY from .env.
+  install -m 600 "$ROOT/.env" "$BACKUP_DIR/env-$stamp" \
+    || die "backup failed: cannot copy .env"
   local pattern
   for pattern in 'builds-*.db' 'env-*'; do
     find "$BACKUP_DIR" -maxdepth 1 -name "$pattern" -printf '%f\n' \
