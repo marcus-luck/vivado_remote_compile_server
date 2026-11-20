@@ -124,28 +124,48 @@ def restore(db_path: pathlib.Path, source: BinaryIO) -> pathlib.Path | None:
 
 
 def _keep_old_database(db_path: pathlib.Path) -> pathlib.Path | None:
-    """Moves a database and its write-ahead log aside.
+    """Keeps a second name for a database and its write-ahead log.
 
-    The write-ahead log moves with it, so it is applied when the kept copy
-    is opened, and not to the database that takes its place.
+    The files are hard-linked, so the database never goes missing. The
+    write-ahead log is then taken from the database, so it is applied when
+    the kept copy is opened, and not to the database that takes its place.
 
     Args:
         db_path: The database.
 
     Returns:
-        The new location, or None if there was no database.
+        The kept copy, or None if there was no database.
     """
-    pathlib.Path(f"{db_path}-shm").unlink(missing_ok=True)
-    if not db_path.exists():
-        pathlib.Path(f"{db_path}-wal").unlink(missing_ok=True)
-        return None
-    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    kept = db_path.with_name(f"{db_path.name}.before-restore-{stamp}")
     wal = pathlib.Path(f"{db_path}-wal")
-    if wal.exists():
-        os.replace(wal, f"{kept}-wal")
-    os.replace(db_path, kept)
+    kept = None
+    if db_path.exists():
+        _checkpoint(db_path)
+        stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        kept = db_path.with_name(f"{db_path.name}.before-restore-{stamp}")
+        os.link(db_path, kept)
+        if wal.exists():
+            os.link(wal, f"{kept}-wal")
+    wal.unlink(missing_ok=True)
+    pathlib.Path(f"{db_path}-shm").unlink(missing_ok=True)
     return kept
+
+
+def _checkpoint(db_path: pathlib.Path) -> None:
+    """Writes the write-ahead log of a database into the database file.
+
+    A damaged database may refuse. Its log then stays where it is.
+
+    Args:
+        db_path: The database. Nothing may have it open.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
