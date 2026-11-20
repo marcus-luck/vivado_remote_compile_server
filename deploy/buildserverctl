@@ -273,14 +273,13 @@ cmd_deploy() {
     die "tests failed; nothing deployed, checkout back at ${old:0:7}"
   fi
 
-  start_stack
-  if ! wait_healthy; then
+  if ! start_stack || ! wait_healthy; then
     compose logs --tail 30 api >&2 || true
     log "rolling back to ${old:0:7}"
     checkout "$old"
     start_stack
     wait_healthy || log "warning: the old version is not healthy either"
-    die "deploy of $ref failed its health check; rolled back"
+    die "deploy of $ref failed. Rolled back to ${old:0:7}."
   fi
   printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$new" "$ref" >>"$HISTORY"
   log "deployed $ref at ${new:0:7}"
@@ -375,7 +374,7 @@ cmd_restore() {
   if ! compose run --rm --no-deps -T worker \
     python -m buildserver.admin restore - <"$file"; then
     compose up -d
-    die "restore refused; the old database is back in service"
+    die "restore failed, see above. The old database is still in service."
   fi
   compose up -d
   wait_healthy || die "api not healthy after the restore"
