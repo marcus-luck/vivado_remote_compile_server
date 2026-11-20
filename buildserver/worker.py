@@ -379,24 +379,12 @@ def run_build(
         # Artifacts are collected whatever the outcome: the reports matter
         # most when a build fails.
         if root is not None:
-            artifact_dir = root / settings.artifact_dir.replace(
-                config.NAME_PLACEHOLDER, build["name"]
-            )
-            has_artifacts = artifact_dir.is_dir() and any(
-                path.is_file() for path in artifact_dir.rglob("*")
-            )
-            if has_artifacts:
-                storage.zip_dir(
-                    artifact_dir,
-                    store.artifacts_path(build_id),
-                    extra={"build.log": log_path},
-                )
-            elif status == db.SUCCEEDED:
-                status = db.FAILED
-                error = (
-                    "build produced no artifacts in"
-                    f" {artifact_dir.relative_to(root).as_posix()}"
-                )
+            if settings.build_user:
+                # No build process may change the files while they are zipped.
+                sandbox.clean_up(settings.build_user, store.work_root)
+            missing = collect_artifacts(settings, store, build, work_dir, root)
+            if missing and status == db.SUCCEEDED:
+                status, error = db.FAILED, missing
     except Exception as e:  # pylint: disable=broad-exception-caught
         _logger.exception("build %s failed", build_id)
         status, error = db.FAILED, f"{type(e).__name__}: {e}"
@@ -414,6 +402,51 @@ def run_build(
         status,
         f": {error}" if error else "",
     )
+
+
+def collect_artifacts(
+    settings: config.Settings,
+    store: storage.Storage,
+    build: db.Build,
+    work_dir: pathlib.Path,
+    root: pathlib.Path,
+) -> str | None:
+    """Zips the artifact directory of a build together with its log.
+
+    The worker can read what the build account cannot, so the artifacts must
+    not reach outside the work directory. The artifact directory is refused
+    if it, or a directory above it, is a symbolic link, and only regular
+    files are zipped. Hard links are no way out either: the build account
+    cannot enter the data directory, and the kernel protects hard links.
+
+    Args:
+        settings: The server settings.
+        store: The data directory.
+        build: The build. Its processes must have ended.
+        work_dir: The work directory of the build.
+        root: The directory holding the build script, inside work_dir.
+
+    Returns:
+        Why no artifacts were collected, or None if they were.
+    """
+    relative = settings.artifact_dir.replace(
+        config.NAME_PLACEHOLDER, build["name"]
+    )
+    artifact_dir = root / relative
+    if not artifact_dir.resolve().is_relative_to(work_dir.resolve()) or any(
+        path.is_symlink()
+        for path in (artifact_dir, *artifact_dir.parents)
+        if path.is_relative_to(work_dir)
+    ):
+        return f"artifact directory {relative} is outside the work directory"
+    if not artifact_dir.is_dir() or not storage.regular_files(artifact_dir):
+        return f"build produced no artifacts in {relative}"
+    storage.zip_dir(
+        artifact_dir,
+        store.artifacts_path(build["id"]),
+        extra={"build.log": store.log_path(build["id"])},
+    )
+    return None
 
 
 def _empty_dir(path: pathlib.Path) -> None:

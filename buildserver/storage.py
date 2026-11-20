@@ -21,6 +21,7 @@ record is gone, which a failed delete can leave behind.
 import os
 import pathlib
 import shutil
+import stat
 import zipfile
 
 
@@ -161,6 +162,28 @@ def find_build_root(
     return None
 
 
+def regular_files(src: pathlib.Path) -> list[pathlib.Path]:
+    """Lists the regular files under a directory.
+
+    Symbolic links are skipped, to files and to directories alike, and so
+    are FIFOs, sockets and devices. A build cannot use them to put a file
+    it cannot read itself into its artifacts.
+
+    Args:
+        src: The directory. It must not be a symbolic link itself.
+
+    Returns:
+        The files, sorted.
+    """
+    files = []
+    for dirpath, _, filenames in os.walk(src, followlinks=False):
+        for filename in filenames:
+            path = pathlib.Path(dirpath) / filename
+            if stat.S_ISREG(path.lstat().st_mode):
+                files.append(path)
+    return sorted(files)
+
+
 def zip_dir(
     src: pathlib.Path,
     zip_path: pathlib.Path,
@@ -173,15 +196,15 @@ def zip_dir(
 
     Args:
         src: Directory whose contents go at the top level of the archive.
+            Only its regular files are zipped (see regular_files).
         zip_path: The archive to write. Replaced if it exists.
         extra: Additional files to add, as archive name to file path.
     """
     tmp_path = zip_path.with_name(zip_path.name + ".tmp")
     with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as archive:
         if src.is_dir():
-            for path in sorted(src.rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(src).as_posix())
+            for path in regular_files(src):
+                archive.write(path, path.relative_to(src).as_posix())
         for arcname, path in (extra or {}).items():
             archive.write(path, arcname)
     os.replace(tmp_path, zip_path)

@@ -54,6 +54,15 @@ out.mkdir(parents=True)
 (out / "done").write_text("yes")
 """
 SLOW_BUILD = "import time\ntime.sleep(120)\n"
+# Links files the build account cannot read into its artifacts.
+SYMLINK_BUILD = """
+import os, pathlib, sys
+out = pathlib.Path("bitfiles/generated") / sys.argv[1]
+out.mkdir(parents=True)
+(out / "fw.bit").write_bytes(b"bitstream")
+for name, path in {targets!r}.items():
+    os.symlink(path, out / name)
+"""
 GOOD_BUILD = """
 import pathlib, sys
 out = pathlib.Path("bitfiles/generated") / sys.argv[1]
@@ -199,7 +208,8 @@ def test_worker_wraps_the_build_and_cleans_up(
     assert seen["user"] == "builder" and seen["tmp"]
     assert seen["home"] == store.home_dir(build["id"])
     assert "BUILDSERVER_SESSION_SECRET" not in seen["env"]
-    assert cleanups == [("builder", store.work_root)] * 2
+    # Before the build, before the artifacts are zipped, and after it.
+    assert cleanups == [("builder", store.work_root)] * 3
     assert not stale.exists() and not seen["home"].exists()
 
 
@@ -333,3 +343,21 @@ def test_timed_out_build_is_killed(sandboxed):
     assert "timed out" in database.get(build["id"])["error"]
     assert builder_processes() == ""
     assert not store.home_dir(build["id"]).exists()
+
+
+@pytest.mark.sandbox
+@needs_sandbox
+def test_build_cannot_link_the_workers_secrets_into_its_artifacts(sandboxed):
+    settings, database, store, client = sandboxed
+    targets = {
+        "database": str(store.db_path),
+        "worker_environ": f"/proc/{os.getpid()}/environ",
+        "data_dir": str(store.data_dir),
+    }
+    build = upload(client, SYMLINK_BUILD.format(targets=targets))
+    worker.run_once(settings, database, store)
+
+    assert database.get(build["id"])["status"] == "succeeded"
+    resp = client.get(f"/api/builds/{build['id']}/artifacts")
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert sorted(zf.namelist()) == ["build.log", "fw.bit"]

@@ -153,6 +153,62 @@ def test_failing_build(env):
     )
 
 
+def needs_symlinks(tmp_path):
+    """Skips the test where symbolic links cannot be made (Windows)."""
+    try:
+        os.symlink(tmp_path, tmp_path / "probe-link")
+    except OSError:
+        pytest.skip("cannot make symbolic links here")
+    os.unlink(tmp_path / "probe-link")
+
+
+def test_zip_dir_skips_links_and_special_files(tmp_path):
+    needs_symlinks(tmp_path)
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "builds.db").write_text("secret")
+    src = tmp_path / "src"
+    (src / "route").mkdir(parents=True)
+    (src / "fw.bit").write_text("bitstream")
+    (src / "route" / "timing.rpt").write_text("met")
+    os.symlink(secret_dir / "builds.db", src / "db")
+    os.symlink(secret_dir, src / "data")
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(src / "fifo")
+
+    storage.zip_dir(src, tmp_path / "out.zip")
+
+    with zipfile.ZipFile(tmp_path / "out.zip") as zf:
+        assert zf.namelist() == ["fw.bit", "route/timing.rpt"]
+
+
+# Makes the artifact directory a link to a directory outside the package.
+OUTSIDE_BUILD = """
+import os, pathlib, sys
+outside = pathlib.Path(sys.argv[2])
+(outside / "generated" / sys.argv[1]).mkdir(parents=True)
+(outside / "generated" / sys.argv[1] / "builds.db").write_text("secret")
+os.symlink(outside, "bitfiles")
+"""
+
+
+def test_artifact_directory_outside_the_work_directory(env, tmp_path):
+    settings, database, store, client = env
+    needs_symlinks(tmp_path)
+    outside = tmp_path / "outside"
+    settings = dataclasses.replace(
+        settings,
+        build_command=[sys.executable, "build.py", "{name}", str(outside)],
+    )
+    build = upload(client, make_package(OUTSIDE_BUILD)).json()
+    worker.run_once(settings, database, store)
+
+    build = client.get(f"/api/builds/{build['id']}").json()
+    assert build["status"] == "failed"
+    assert "outside the work directory" in build["error"]
+    assert not build["has_artifacts"]
+
+
 def test_missing_build_script(env):
     settings, database, store, client = env
     buf = io.BytesIO()
