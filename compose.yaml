@@ -42,7 +42,7 @@ services:
       - data:/data
     security_opt:
       - no-new-privileges:true
-    # deploy/buildserverctl uses healthz to check if a deploy is succesful.
+    # deploy/buildserverctl uses healthz to check if a deploy is successful.
     healthcheck:
       test:
         - CMD
@@ -69,7 +69,8 @@ services:
       - data:/data
       - work:/work
       - ${VIVADO_DIR:-/opt/Xilinx}:/opt/Xilinx:ro
-    # If a workers restarts a running build fails, need time to be destroyed.
+    # If a worker restarts, a running build fails. This gives it time to be
+    # cleaned up.
     stop_grace_period: 30s
     init: true
     # Uncomment to cap what a build can take:
